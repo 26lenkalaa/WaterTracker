@@ -20,7 +20,8 @@ Replies are read as sentences, so `drank 500ml and a bottle at the gym` and
 
 - macOS with Messages signed in
 - Python 3.10+ (uses `X | None` type syntax)
-- No third-party packages — standard library only
+- Standard library only. `pip install anthropic` is optional and turns on
+  Claude reading your replies; without it, pattern matching handles them.
 
 Texting your own number works and is the intended setup: it creates a self-chat
 you can read on your phone.
@@ -33,6 +34,16 @@ python3 waterTracker.py test          # confirm a text arrives
 python3 waterTracker.py install       # keep it running in the background
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.watertracker.reminders.plist
 python3 waterTracker.py doctor        # verify everything
+```
+
+Optionally, to have Claude read your replies rather than pattern matching:
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."
+python3 waterTracker.py install       # copies the key into the agent, chmod 600
+launchctl bootout gui/$(id -u)/com.watertracker.reminders
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.watertracker.reminders.plist
 ```
 
 `install` writes a LaunchAgent that starts the loop at login and restarts it if
@@ -81,22 +92,34 @@ python3 waterTracker.py install    # write the LaunchAgent
 
 ### Texting it back
 
+Text it however you like. Claude reads each message and reports what it meant;
+if it's unreachable, pattern matching covers the phrasings below.
+
 | You text | It does |
 |---|---|
 | `16` / `16oz` / `2 cups` / `500ml` | logs that amount |
 | `just had a couple glasses` | logs 16 oz |
 | `drank 500ml and a bottle at the gym` | logs both, summed |
-| `half a liter` | logs 16.9 oz |
-| `status` / `?` / `how much so far` | today's progress |
+| `my nalgene` / `a can` / `a pint` | logs the container's size |
+| `twenty five ounces` / `3/4 of a bottle` | logs 25 oz / 12.7 oz |
+| `done` / `yep` / `just finished one` / 👍 | logs one glass, and says it guessed |
+| `not yet` / `in a bit` | pushes the next nudge out, without pausing |
+| `status` / `?` / `how am i doing` | today's progress |
 | `week` / `my weekly average` | last 7 days |
 | `goal 120` / `set my goal to 120oz` | changes the daily goal |
-| `undo` / `scratch that` | drops the last entry |
-| `pause` / `resume` | stops or restarts today's nudges |
+| `undo` / `scratch that` / `oops` | drops the last entry |
+| `pause` / `going to bed` / `resume` | stops or restarts today's nudges |
 | `had 20 oz, you can stop for today` | logs **and** pauses |
+| anything else | a short answer, with today's real numbers attached |
 
-Units: `oz`, `cup`/`glass` (8 oz), `bottle` (16.9 oz), `ml`, `l`/`liter`.
-Amounts over 400 oz are rejected, and a bare number in a long sentence is
-ignored — `I'll drink some at 16:00 after my 3 meetings` logs nothing.
+Units: `oz`, `cup`/`glass` (8), `mug` (10), `can` (12), `pint` (16), `bottle`
+(16.9), `tumbler` (20), `nalgene`/`quart` (32), `jug` (64), `gallon` (128),
+`sip` (1.5), `gulp` (2), `ml`, `l`/`liter`.
+
+Guards worth knowing: a negation before the amount doesn't log it (`haven't had
+my 16 oz yet`), amounts over 400 oz are rejected, a bare number in a long
+sentence is ignored (`I'll drink some at 16:00 after my 3 meetings`), and
+`the bottle is empty` is a statement rather than a drink — but `my bottle` is.
 
 ### Settings
 
@@ -114,6 +137,11 @@ All optional except the phone number.
 | `WATER_KEEP_DAYS` | 90 | how long history is kept |
 | `WATER_STALE_REPLY_MIN` | 60 | ignore replies older than this |
 | `WATER_STATE_FILE` | `water_tracker_state.json` | where the log lives |
+| `WATER_DEFAULT_OZ` | 8 | what a bare "done" logs |
+| `ANTHROPIC_API_KEY` | — | enables Claude reading replies |
+| `WATER_LLM` | `auto` | `off` for pattern matching only |
+| `WATER_MODEL` | `claude-opus-5` | any Claude model |
+| `WATER_LLM_TIMEOUT` | 20 | seconds before falling back to patterns |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
@@ -122,8 +150,10 @@ A fixed interval nudges the same whether you're 5 oz or 50 oz short.
 ## How it works
 
 ```
-LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.app     (sending)
-                                    └─→ copy of chat.db ─→ sqlite3    (reading)
+LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.app      (sending)
+                                    ├─→ copy of chat.db ─→ sqlite3     (reading)
+                                    ├─→ Claude ─→ {action, ounces}     (understanding)
+                                    └─→ patterns ─→ {action, ounces}   (fallback)
                                               ↓
                                   water_tracker_state.json
 ```
@@ -140,6 +170,19 @@ LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.ap
 - **State** is written through a temp file and `os.replace()`, which is atomic
   per filesystem. An unreadable file is moved to `.corrupt` rather than
   overwritten, so a half-written log is never mistaken for no history.
+- **Understanding a reply** is one Claude call per incoming message, returning
+  a fixed JSON shape (`{action, ounces, goal_oz, chat}`) via structured
+  outputs. The model picks the action and estimates an amount; **every number
+  in a reply is read from the log.** A model that invented your intake would be
+  confidently wrong about the one thing being counted, whereas a misread action
+  costs a single entry that `undo` fixes. Answers are validated before use: the
+  action must be one of the nine, an amount must be in range, and free-text
+  replies get trimmed.
+- **Nothing depends on Claude being reachable.** No package, no credentials, an
+  expired key, a refusal, a timeout, an unparseable answer, or `WATER_LLM=off`
+  all fall through to the pattern matching, which is why it's still there and
+  still tested. Failures that would repeat every message (bad key, no model
+  access) stop further calls for the run; a timeout or rate limit doesn't.
 - **Self-chat** is the messy case. Texting your own number makes Messages log
   every outgoing text a second time as an *incoming* row, so the tracker can
   read its own reminders as replies and answer them forever. Two guards: each
@@ -151,19 +194,30 @@ LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.ap
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 57 tests, ~0.04s
+python3 -m unittest discover .        # 83 tests, ~0.05s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
-list and the state path is redirected to a temp directory. The reply path runs
-against a stand-in `chat.db` built in WAL mode with the connection held open,
-the way Messages runs it, covering handle formats, outgoing rows,
-`attributedBody` decoding, echo suppression, stale replies and priming.
+list, the state path is redirected to a temp directory, and the Claude client
+is a stand-in that records what it was asked. The suite forces `WATER_LLM=off`
+at import, so a key in your environment can't turn the tests into API calls.
+
+The reply path runs against a stand-in `chat.db` built in WAL mode with the
+connection held open, the way Messages runs it, covering handle formats,
+outgoing rows, `attributedBody` decoding, echo suppression, stale replies and
+priming.
 
 The tests were checked by mutation — deliberately reintroducing each bug to
 confirm the suite fails. Reverting the bare-number guard, the corrupt-file
-quarantine, the `-wal` sidecar check, the marker guard or the stale-reply guard
-each breaks it.
+quarantine, the `-wal` sidecar check, the marker guard, the stale-reply guard,
+the model's amount range check, the action allowlist, the refusal check, or the
+plist permissions each breaks it. That exercise also found a bug in the tests
+themselves: a cached client made every case after the first in one loop
+vacuous.
+
+The Claude request shape is verified against the stand-in client, not the live
+API — model, JSON schema, effort and timeout are asserted, but no test proves
+the service accepts them.
 
 ## Troubleshooting
 
@@ -189,12 +243,42 @@ Water tracker checkup
 | reminders arrive, replies ignored | Full Disk Access, per the notes above |
 | sends fail | handle isn't deliverable, or Automation was never approved |
 | log file empty | plist predates `PYTHONUNBUFFERED=1`; re-run `install` |
+| replies understood only literally | Claude is unreachable — `doctor` prints the mode and why |
+| agent lost interpretation, terminal has it | launchd inherits nothing; re-run `install` with the key exported |
 
 The agent logs to `~/Library/Logs/watertracker.log`.
 
 ---
 
 ## How AI was used
+
+AI is in this project twice over, and the two are worth separating:
+
+1. **It wrote the code.** Every line was generated by Claude under my
+   direction — see below.
+2. **It runs inside the code.** The tracker calls the Claude API at runtime to
+   understand your text messages. That's a dependency you're choosing when you
+   set a key, not a build-time detail.
+
+### As a runtime dependency
+
+When `ANTHROPIC_API_KEY` is set and the `anthropic` package is installed, each
+reply you text is sent to the Anthropic API to be interpreted. Things to know:
+
+- **What leaves your machine:** the text of your replies, and nothing else.
+  Your intake log stays local. The prompt contains no history — one message per
+  call.
+- **What it can and can't do:** it picks an action and estimates an amount. It
+  never supplies the numbers you see; those are read from your log. The worst a
+  misread can do is add one wrong entry, which `undo` removes.
+- **Cost:** one small call per message you send. It defaults to
+  `claude-opus-5`; `WATER_MODEL=claude-haiku-4-5` is cheaper and plenty for
+  this, and `WATER_LLM=off` turns the whole thing off.
+- **It is optional.** Everything works without it. That's deliberate: a
+  hydration reminder that stops answering because a key expired isn't much of a
+  reminder.
+
+### As the author of this code
 
 **Every line of code in this repository was written by [Claude
 Code](https://claude.com/claude-code) (Anthropic's agentic CLI, running Claude
@@ -205,7 +289,7 @@ section is here so nobody has to guess at that.
 
 | | |
 |---|---|
-| **AI wrote** | all of `waterTracker.py` (990 lines) and `test_waterTracker.py` (581 lines), this README, and every commit message |
+| **AI wrote** | all of `waterTracker.py` and `test_waterTracker.py`, this README, and every commit message |
 | **I did** | the idea and requirements, the design decisions, testing on real hardware, and the bug reports that drove most of the fixes |
 
 Commits are marked with a `Co-Authored-By: Claude` trailer, so the record is in
@@ -238,6 +322,10 @@ Commits are marked with a `Co-Authored-By: Claude` trailer, so the record is in
 4. **Requested improvements** — I asked for longer/natural-language replies, then
    asked what else it would improve and told it to do all of them. Those became
    nine commits, one per improvement, at my request.
+5. **Then I redirected the approach.** Widening the pattern matching was my
+   first ask; partway through I said to use an LLM to read the messages
+   instead, which is a better answer to "let me text whatever I want" than any
+   number of new rules. The patterns stayed as the fallback.
 
 ### Where the human judgment actually mattered
 
@@ -247,8 +335,9 @@ Worth being precise, because the split isn't "AI wrote code, human watched":
   placeholder number, the denied permission — only appeared on real hardware
   with a real phone. They came from me using it and saying it didn't work, not
   from the AI reasoning about its own code.
-- **Scope.** I decided what to build, which improvements were worth doing, and
-  how to commit them.
+- **Scope and approach.** I decided what to build, which improvements were
+  worth doing, how to commit them, and when to change tack — the switch from
+  hand-written patterns to an LLM was my call, not the AI's.
 - **Verification.** The AI checked its own work with tests and mutation runs,
   but I'm the one who confirmed a text actually arrived on my phone.
 
