@@ -1,0 +1,9 @@
+# Local intake log, written at runtime. Personal data, not source.
+water_tracker_state.json
+water_tracker_state.json.tmp
+water_tracker_state.json.corrupt
+
+__pycache__/
+*.pyc
+
+.DS_Store
