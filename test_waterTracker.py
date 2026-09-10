@@ -1,9 +1,10 @@
 """Tests for waterTracker.
 
-	python -m unittest discover claudeCode
+	python -m unittest discover .
 
-Nothing here touches Messages or the real state file: sends are captured in a
-list and STATE_PATH is redirected into a temp directory.
+Nothing here touches Messages, the network, or the real state file: sends are
+captured in a list, STATE_PATH is redirected into a temp directory, and the
+Claude client is a stand-in that records what it was asked.
 """
 
 import importlib.util
@@ -17,8 +18,12 @@ import unittest
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("WATER_PHONE", "+15551234567")
+# Forced, not defaulted: with a key in the environment the suite would
+# otherwise send every test reply to the real API.
+os.environ["WATER_LLM"] = "off"
 _spec = importlib.util.spec_from_file_location("waterTracker", Path(__file__).with_name("waterTracker.py"))
 wt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wt)
@@ -156,6 +161,47 @@ class MessageTimeTest(unittest.TestCase):
 		self.assertIsNone(wt.message_time(0))
 
 
+class InstallTest(unittest.TestCase):
+	def setUp(self):
+		folder = tempfile.TemporaryDirectory()
+		self.addCleanup(folder.cleanup)
+		self.home = Path(folder.name)
+		for name, value in (
+			("PLIST_PATH", self.home / "agent.plist"),
+			("LOG_PATH", self.home / "agent.log"),
+			("STATE_PATH", self.home / "state.json"),
+		):
+			previous = getattr(wt, name)
+			setattr(wt, name, value)
+			self.addCleanup(setattr, wt, name, previous)
+
+	def install_with(self, **environment):
+		for key, value in environment.items():
+			previous = os.environ.get(key)
+			os.environ[key] = value
+			self.addCleanup(lambda k=key, v=previous: os.environ.pop(k) if v is None else os.environ.__setitem__(k, v))
+		wt.install_agent()
+		import plistlib
+		return plistlib.loads(wt.PLIST_PATH.read_bytes())["EnvironmentVariables"]
+
+	def test_carries_the_settings_the_agent_cannot_inherit(self):
+		settings = self.install_with(WATER_PHONE="+15551234567", WATER_MODEL="claude-haiku-4-5")
+		self.assertEqual(settings["WATER_PHONE"], "+15551234567")
+		self.assertEqual(settings["WATER_MODEL"], "claude-haiku-4-5")
+		self.assertEqual(settings["PYTHONUNBUFFERED"], "1")
+		self.assertTrue(Path(settings["WATER_STATE_FILE"]).is_absolute(), "launchd runs from /")
+
+	def test_a_copied_key_is_not_left_world_readable(self):
+		settings = self.install_with(WATER_PHONE="+15551234567", ANTHROPIC_API_KEY="sk-ant-test")
+		self.assertEqual(settings["ANTHROPIC_API_KEY"], "sk-ant-test")
+		self.assertEqual(wt.PLIST_PATH.stat().st_mode & 0o077, 0, "the key is readable by others")
+
+	def test_no_key_no_key_in_the_plist(self):
+		os.environ.pop("ANTHROPIC_API_KEY", None)
+		settings = self.install_with(WATER_PHONE="+15551234567")
+		self.assertNotIn("ANTHROPIC_API_KEY", settings)
+
+
 class HandleTest(unittest.TestCase):
 	def test_accepts_phone_numbers_and_emails(self):
 		for handle in ("+15551234567", "5551234567", "(555) 123-4567", "me@example.com"):
@@ -178,6 +224,9 @@ class TrackerTestCase(unittest.TestCase):
 		self.addCleanup(folder.cleanup)
 		self.state_path = Path(folder.name) / "state.json"
 		self.patch(wt, "STATE_PATH", self.state_path)
+		# Pattern matching is what these tests are about, so the model is out
+		# of the way regardless of what is installed or configured.
+		self.patch(wt, "llm_plan", lambda text: None)
 		self.tracker = wt.WaterTracker()
 		self.sent = []
 		self.tracker.send = self.sent.append
@@ -235,6 +284,206 @@ class StateTest(TrackerTestCase):
 		with self.assertRaises(SystemExit) as caught:
 			tracker.send("hello")
 		self.assertIn("not a phone number", str(caught.exception))
+
+
+class FakeClient:
+	"""Stands in for anthropic.Anthropic, recording what it was asked."""
+
+	def __init__(self, outcome):
+		self.outcome = outcome
+		self.requests = []
+		self.options = []
+		self.messages = SimpleNamespace(create=self._create)
+
+	def with_options(self, **options):
+		self.options.append(options)
+		return self
+
+	def _create(self, **request):
+		self.requests.append(request)
+		if isinstance(self.outcome, Exception):
+			raise self.outcome
+		return self.outcome
+
+
+def fake_sdk(client):
+	"""A stand-in for the anthropic module: exception classes and a factory."""
+
+	class BadRequestError(Exception):
+		message = "bad request"
+
+	class APIStatusError(Exception):
+		status_code = 503
+
+	return SimpleNamespace(
+		Anthropic=lambda **kwargs: client,
+		AuthenticationError=type("AuthenticationError", (Exception,), {}),
+		NotFoundError=type("NotFoundError", (Exception,), {}),
+		BadRequestError=BadRequestError,
+		RateLimitError=type("RateLimitError", (Exception,), {}),
+		APITimeoutError=type("APITimeoutError", (Exception,), {}),
+		APIConnectionError=type("APIConnectionError", (Exception,), {}),
+		APIStatusError=APIStatusError,
+	)
+
+
+def fake_answer(payload, stop_reason="end_turn"):
+	text = payload if isinstance(payload, str) else json.dumps(payload)
+	return SimpleNamespace(
+		content=[SimpleNamespace(type="text", text=text)],
+		stop_reason=stop_reason,
+	)
+
+
+class LlmPlanTest(unittest.TestCase):
+	"""The interpretation call: request shape, validation, and failure modes."""
+
+	def setUp(self):
+		self.previous = (wt.LLM_MODE, wt.anthropic, wt._llm_client, wt._llm_broken)
+		wt.LLM_MODE = "auto"
+		wt._llm_client = None
+		wt._llm_broken = False
+		self.addCleanup(self.restore)
+
+	def restore(self):
+		wt.LLM_MODE, wt.anthropic, wt._llm_client, wt._llm_broken = self.previous
+
+	def install(self, outcome):
+		# Resetting the cached client matters: without it a second install in
+		# one test silently keeps answering with the first fake's response,
+		# which made every payload after the first in a loop vacuous.
+		wt._llm_client = None
+		wt._llm_broken = False
+		client = FakeClient(outcome)
+		wt.anthropic = fake_sdk(client)
+		return client
+
+	def test_reads_a_valid_answer(self):
+		self.install(fake_answer({"action": "log", "ounces": 24, "goal_oz": None, "chat": None}))
+		self.assertEqual(wt.llm_plan("finished the one on my desk"), {
+			"action": "log", "ounces": 24.0, "goal_oz": None, "chat": None,
+		})
+
+	def test_asks_for_json_from_the_configured_model(self):
+		client = self.install(fake_answer({"action": "status", "ounces": None, "goal_oz": None, "chat": None}))
+		wt.llm_plan("how am i doing")
+
+		request = client.requests[0]
+		self.assertEqual(request["model"], wt.LLM_MODEL)
+		self.assertEqual(request["messages"], [{"role": "user", "content": "how am i doing"}])
+		self.assertIn("water-intake tracker", request["system"])
+		self.assertEqual(request["output_config"]["format"]["type"], "json_schema")
+		self.assertEqual(request["output_config"]["format"]["schema"], wt.PLAN_SCHEMA)
+		self.assertEqual(request["output_config"]["effort"], "low")
+		self.assertEqual(client.options[0]["timeout"], wt.LLM_TIMEOUT)
+
+	def test_turned_off_by_configuration_without_calling_out(self):
+		client = self.install(fake_answer({"action": "status", "ounces": None, "goal_oz": None, "chat": None}))
+		wt.LLM_MODE = "off"
+		self.assertIsNone(wt.llm_plan("16 oz"))
+		self.assertEqual(client.requests, [], "called the API while switched off")
+
+	def test_a_refusal_is_not_a_plan(self):
+		self.install(fake_answer({"action": "log", "ounces": 16, "goal_oz": None, "chat": None}, "refusal"))
+		self.assertIsNone(wt.llm_plan("16 oz"))
+
+	def test_unusable_answers_are_rejected(self):
+		for payload in (
+			"not json at all",
+			{"action": "log", "ounces": None, "goal_oz": None, "chat": None},      # no amount
+			{"action": "log", "ounces": 9000, "goal_oz": None, "chat": None},      # implausible
+			{"action": "log", "ounces": -5, "goal_oz": None, "chat": None},        # negative
+			{"action": "goal", "ounces": None, "goal_oz": None, "chat": None},     # no goal
+			{"action": "chat", "ounces": None, "goal_oz": None, "chat": "  "},     # nothing said
+			{"action": "teleport", "ounces": None, "goal_oz": None, "chat": None}, # invented
+		):
+			with self.subTest(payload=payload):
+				self.install(fake_answer(payload))
+				self.assertIsNone(wt.llm_plan("16 oz"))
+
+	def test_long_chat_replies_are_trimmed(self):
+		self.install(fake_answer({
+			"action": "chat", "ounces": None, "goal_oz": None, "chat": "word " * 500,
+		}))
+		plan = wt.llm_plan("tell me about water")
+		self.assertEqual(len(plan["chat"]), wt.MAX_CHAT_CHARS)
+
+	def test_a_permanent_failure_stops_further_calls(self):
+		client = self.install(None)
+		client.outcome = wt.anthropic.AuthenticationError("401")
+		self.assertIsNone(wt.llm_plan("16 oz"))
+		self.assertFalse(wt.llm_ready(), "kept calling an API that rejected the key")
+
+	def test_a_passing_failure_keeps_the_model_in_play(self):
+		client = self.install(None)
+		client.outcome = wt.anthropic.APITimeoutError("slow")
+		self.assertIsNone(wt.llm_plan("16 oz"))
+		self.assertTrue(wt.llm_ready(), "gave up after one timeout")
+
+	def test_every_failure_mode_returns_none(self):
+		sdk = fake_sdk(FakeClient(None))
+		for name in (
+			"AuthenticationError", "NotFoundError", "BadRequestError", "RateLimitError",
+			"APITimeoutError", "APIConnectionError", "APIStatusError",
+		):
+			with self.subTest(error=name):
+				wt._llm_client = None
+				wt._llm_broken = False
+				client = self.install(None)
+				client.outcome = getattr(wt.anthropic, name)("boom")
+				self.assertIsNone(wt.llm_plan("16 oz"))
+
+
+class FollowPlanTest(TrackerTestCase):
+	"""Acting on a plan, and falling back when there is none."""
+
+	def plan(self, action, **fields):
+		full = {"action": action, "ounces": None, "goal_oz": None, "chat": None}
+		full.update(fields)
+		self.patch(wt, "llm_plan", lambda text: full)
+
+	def test_a_log_plan_records_the_amount(self):
+		self.plan("log", ounces=24)
+		self.tracker.handle_reply("finished the one on my desk")
+		self.assertEqual(self.tracker.total(), 24)
+		self.assertIn("Logged 24 oz", self.sent[-1])
+
+	def test_a_goal_plan_changes_the_goal(self):
+		self.plan("goal", goal_oz=120)
+		self.tracker.handle_reply("lets aim higher from now on")
+		self.assertEqual(self.tracker.goal, 120)
+
+	def test_chat_uses_the_models_words_and_the_logs_numbers(self):
+		self.plan("chat", chat="Coffee counts, and so does tea.")
+		self.tracker.handle_reply("does coffee count")
+		self.assertIn("Coffee counts", self.sent[-1])
+		self.assertIn("0/100 oz", self.sent[-1], "the progress line comes from the log")
+		self.assertEqual(self.tracker.total(), 0)
+
+	def test_each_action_reaches_its_handler(self):
+		for action, expected in (
+			("status", "Today:"),
+			("week", "oz/day average"),
+			("pause", "Paused"),
+			("resume", "Reminders back on"),
+			("later", "check back later"),
+			("undo", "Nothing logged"),
+		):
+			with self.subTest(action=action):
+				self.plan(action)
+				self.tracker.handle_reply("something")
+				self.assertIn(expected, self.sent[-1])
+
+	def test_no_plan_falls_back_to_pattern_matching(self):
+		self.patch(wt, "llm_plan", lambda text: None)
+		self.tracker.handle_reply("just had a couple glasses")
+		self.assertEqual(self.tracker.total(), 16, "patterns did not take over")
+
+	def test_the_model_sees_the_message_as_typed(self):
+		seen = []
+		self.patch(wt, "llm_plan", lambda text: seen.append(text) or None)
+		self.tracker.handle_reply("  Had TWO Cups  ")
+		self.assertEqual(seen, ["Had TWO Cups"], "case and padding should survive")
 
 
 class MarkerTest(TrackerTestCase):

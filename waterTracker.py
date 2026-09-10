@@ -9,6 +9,20 @@ Setup:
 	export WATER_KEEP_DAYS="90"         # optional, how long history is kept
 	export WATER_STALE_REPLY_MIN="60"   # optional, ignore replies older than this
 
+	Claude reads your replies when it can, which is what lets you text whatever
+	you like instead of a fixed vocabulary. It needs `pip install anthropic` and
+	credentials (ANTHROPIC_API_KEY, or an `ant auth login` profile); without
+	either, pattern matching handles the common phrasings on its own.
+
+	export ANTHROPIC_API_KEY="sk-ant-..."   # enables interpretation
+	export WATER_LLM="off"                  # optional, patterns only
+	export WATER_MODEL="claude-opus-5"      # optional, any Claude model
+	export WATER_DEFAULT_OZ="8"             # optional, a bare "done" logs this
+
+	Your replies are sent to the Anthropic API to be interpreted. Nothing else
+	is: your intake log stays on this machine, and every number in a reply is
+	read from that log rather than written by the model.
+
 	Sending needs Automation access for Messages; macOS prompts on the first send.
 	Reading your replies needs Full Disk Access, because the Messages database is
 	protected: System Settings > Privacy & Security > Full Disk Access, then add
@@ -77,6 +91,24 @@ CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
 # A reply that only confirms drinking, with no amount, counts as this much.
 DEFAULT_SERVING_OZ = float(os.getenv("WATER_DEFAULT_OZ", "8"))
+
+# Claude reads each reply and says what it meant, which is how "finished the
+# one on my desk before heading out" becomes an amount without anyone writing
+# a pattern for it. Optional in every sense: the pattern matching below still
+# runs whenever the model is unreachable, so no key, no network, or no
+# package all degrade to the behaviour that existed before this.
+LLM_MODEL = os.getenv("WATER_MODEL", "claude-opus-5")
+LLM_TIMEOUT = float(os.getenv("WATER_LLM_TIMEOUT", "20"))
+LLM_MODE = os.getenv("WATER_LLM", "auto").lower()  # auto or off
+# Claude writes the wording for conversation only. Every number in a reply
+# comes from the log, because a model that invents your intake is worse than
+# no tracker: it would be confidently wrong about the one thing being counted.
+MAX_CHAT_CHARS = 300
+
+try:
+	import anthropic
+except ModuleNotFoundError:  # pip install anthropic to turn interpretation on
+	anthropic = None
 
 # How long a message we sent stays recognisable as our own self-chat echo.
 # Comfortably more than a poll, or the echo would arrive after its record had
@@ -352,6 +384,183 @@ def decode_body(blob: bytes | None) -> str:
 def digits(handle: str) -> str:
 	"""Last 10 digits of a phone number, for comparing handle formats."""
 	return re.sub(r"\D", "", handle)[-10:]
+
+
+PLAN_ACTIONS = ("log", "status", "week", "goal", "undo", "pause", "resume", "later", "chat")
+
+PLAN_SCHEMA = {
+	"type": "object",
+	"properties": {
+		"action": {"type": "string", "enum": list(PLAN_ACTIONS)},
+		"ounces": {
+			"type": ["number", "null"],
+			"description": "Fluid ounces to log. Only for action 'log'.",
+		},
+		"goal_oz": {
+			"type": ["number", "null"],
+			"description": "New daily goal in fluid ounces. Only for action 'goal'.",
+		},
+		"chat": {
+			"type": ["string", "null"],
+			"description": "One or two sentences answering the message. Only for action 'chat'.",
+		},
+	},
+	"required": ["action", "ounces", "goal_oz", "chat"],
+	"additionalProperties": False,
+}
+
+INTERPRETER_PROMPT = f"""\
+You read one text message sent to a water-intake tracker and report what the \
+sender meant. The sender is texting their own tracker, casually, usually while \
+doing something else.
+
+Pick exactly one action:
+- log: they drank something. Put the total in `ounces`, converted to US fluid \
+ounces. Estimate sensibly from containers and vague amounts: a glass or cup 8, \
+a mug 10, a can 12, a pint 16, a standard water bottle 16.9, a tumbler 20, a \
+large bottle or nalgene 32, a jug 64, a sip 1.5, a gulp 2. A bare confirmation \
+with no amount at all ("done", "yep", "just had some") is {DEFAULT_SERVING_OZ:g}. \
+Any drink counts, not only water.
+- status: they want today's progress.
+- week: they want recent days, an average, or a trend.
+- goal: they want to change the daily goal. Put it in `goal_oz`.
+- undo: they want the last entry removed, including "oops" and "that was wrong".
+- pause: they want reminders to stop for the day, including "going to bed".
+- resume: they want reminders to start again.
+- later: they have not drunk anything yet and want to be asked again soon. Use \
+this for "not yet", "in a bit", and for anything they say they did NOT drink.
+- chat: none of the above. Put a friendly reply of at most two sentences in \
+`chat`, in the voice of a terse, encouraging tracker.
+
+Rules:
+- A negation means it did not happen: "haven't had my 16 oz yet" is later, not log.
+- Never invent numbers for status, week, or chat. The tracker fills those in.
+- Prefer log when they clearly drank something, even if the amount is vague.
+- Amounts above 400 oz are a mistake; treat those as chat and ask.
+- Unused fields must be null."""
+
+_llm_client = None
+_llm_broken = False
+
+
+def llm_ready() -> bool:
+	"""Whether interpretation should be attempted at all."""
+	return LLM_MODE != "off" and anthropic is not None and not _llm_broken
+
+
+def llm_client():
+	"""The shared client, or None when there are no usable credentials.
+
+	The SDK resolves an API key, an auth token, or an `ant auth login`
+	profile on its own, so this only has to notice that none of them worked.
+	"""
+	global _llm_client, _llm_broken
+	if _llm_client is None:
+		try:
+			_llm_client = anthropic.Anthropic(max_retries=1)
+		except Exception as error:  # no credentials anywhere
+			print(f"   Claude interpretation off ({error}); using pattern matching")
+			_llm_broken = True
+			return None
+	return _llm_client
+
+
+def sane_plan(plan: dict) -> dict | None:
+	"""Check a model's answer before acting on it.
+
+	Structured output guarantees the shape, not the sense: an action still has
+	to come with the field it needs, and an amount still has to be plausible.
+	"""
+	action = plan.get("action")
+	if action not in PLAN_ACTIONS:
+		return None
+	if action == "log":
+		ounces = plan.get("ounces")
+		if not isinstance(ounces, (int, float)) or not 0 < ounces <= MAX_LOG_OZ:
+			return None
+		plan["ounces"] = round(float(ounces), 1)
+	if action == "goal":
+		goal = plan.get("goal_oz")
+		if not isinstance(goal, (int, float)) or not 0 < goal <= MAX_LOG_OZ:
+			return None
+		plan["goal_oz"] = round(float(goal), 1)
+	if action == "chat":
+		chat = (plan.get("chat") or "").strip()
+		if not chat:
+			return None
+		plan["chat"] = chat[:MAX_CHAT_CHARS]
+	return plan
+
+
+def llm_plan(text: str) -> dict | None:
+	"""Ask Claude what a reply meant. None whenever that cannot be answered."""
+	if not llm_ready():
+		return None
+	client = llm_client()
+	if client is None:
+		return None
+	try:
+		response = client.with_options(timeout=LLM_TIMEOUT).messages.create(
+			model=LLM_MODEL,
+			max_tokens=512,
+			system=INTERPRETER_PROMPT,
+			messages=[{"role": "user", "content": text}],
+			# Reading one short text is not hard work, and the reply is waiting
+			# on it, so keep the thinking shallow rather than switching it off:
+			# disabling it on this model has its own failure modes.
+			output_config={"effort": "low", "format": {"type": "json_schema", "schema": PLAN_SCHEMA}},
+		)
+	except anthropic.AuthenticationError:
+		print("   Claude interpretation failed: credentials rejected")
+		_disable_llm()
+		return None
+	except anthropic.NotFoundError:
+		print(f"   Claude interpretation failed: no access to model {LLM_MODEL!r}")
+		_disable_llm()
+		return None
+	except anthropic.BadRequestError as error:
+		print(f"   Claude interpretation failed: bad request ({error.message})")
+		_disable_llm()
+		return None
+	except anthropic.RateLimitError:
+		print("   Claude interpretation failed: rate limited")
+		return None
+	except anthropic.APITimeoutError:
+		print(f"   Claude interpretation failed: no answer in {LLM_TIMEOUT:g}s")
+		return None
+	except anthropic.APIConnectionError:
+		print("   Claude interpretation failed: network unreachable")
+		return None
+	except anthropic.APIStatusError as error:
+		print(f"   Claude interpretation failed: API error {error.status_code}")
+		return None
+	if response.stop_reason == "refusal":
+		print("   Claude declined to interpret that message")
+		return None
+	try:
+		answer = next(block.text for block in response.content if block.type == "text")
+		return sane_plan(json.loads(answer))
+	except (StopIteration, json.JSONDecodeError, TypeError, AttributeError) as error:
+		print(f"   Claude interpretation unusable: {error}")
+		return None
+
+
+def llm_status() -> str:
+	"""One line on whether Claude is reading replies, and why not if it isn't."""
+	if LLM_MODE == "off":
+		return "pattern matching (WATER_LLM=off)"
+	if anthropic is None:
+		return "pattern matching (anthropic package not installed)"
+	if _llm_broken:
+		return "pattern matching (Claude unavailable this run)"
+	return f"read by {LLM_MODEL}, with pattern matching as the fallback"
+
+
+def _disable_llm() -> None:
+	"""Stop trying after a failure that will repeat on every message."""
+	global _llm_broken
+	_llm_broken = True
+	print("   falling back to pattern matching for the rest of this run")
 
 
 def message_time(raw: int | None) -> float | None:
@@ -720,9 +929,44 @@ class WaterTracker:
 		suffix = f" {streak}-day streak." if streak > 1 else ""
 		self.send(f"Logged {ounces:g} oz. Goal hit at {self.total():g} oz.{suffix}{note}")
 
+	def follow_plan(self, plan: dict) -> None:
+		"""Act on Claude's reading of a message.
+
+		The action comes from the model; every number in the reply comes from
+		the log, so a misread costs one wrong entry that 'undo' fixes rather
+		than a confidently invented total.
+		"""
+		action = plan["action"]
+		if action == "log":
+			self.log_reply(plan["ounces"])
+		elif action == "goal":
+			self.send(self.set_goal(plan["goal_oz"]))
+		elif action == "status":
+			self.send(f"\U0001f4a7 Today: {self.progress_line()}")
+		elif action == "week":
+			self.send("Last 7 days:\n" + "\n".join(line.strip() for line in self.week_lines()))
+		elif action == "undo":
+			self.send(self.undo())
+		elif action == "pause":
+			self.send(self.pause())
+		elif action == "resume":
+			self.send(f"{self.resume()} {self.progress_line()}")
+		elif action == "later":
+			self.send(self.snooze())
+		else:
+			self.send(f"{plan['chat']}\n{self.progress_line()}")
+
 	def handle_reply(self, body: str) -> None:
 		print(f"<- {body}")
 		text = body.strip().lower()
+
+		# Claude first, since it reads sentences no pattern anticipates, and
+		# the patterns below as the fallback when it cannot answer.
+		plan = llm_plan(body.strip())
+		if plan:
+			print(f"   read as {plan['action']}")
+			self.follow_plan(plan)
+			return
 
 		# Bounded gap before the number so "my goal, drank 16 oz" is not a goal
 		# change; punctuation ends the phrase.
@@ -831,6 +1075,7 @@ class WaterTracker:
 			f"Water tracker running for {self.phone}. Goal {self.goal:g} oz, "
 			f"nudge every {INTERVAL_MIN} min between {WAKE_HOUR}:00 and {SLEEP_HOUR}:00."
 		)
+		print(f"Replies: {llm_status()}")
 		self.prime_replies()
 		while True:
 			try:
@@ -918,6 +1163,16 @@ def install_agent() -> None:
 		"WATER_WAKE_HOUR",
 		"WATER_SLEEP_HOUR",
 		"WATER_POLL_SECONDS",
+		"WATER_KEEP_DAYS",
+		"WATER_STALE_REPLY_MIN",
+		"WATER_DEFAULT_OZ",
+		"WATER_LLM",
+		"WATER_MODEL",
+		"WATER_LLM_TIMEOUT",
+		# launchd jobs inherit nothing from your shell, so the key has to be
+		# written into the plist or the agent quietly loses interpretation.
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
 	):
 		value = os.getenv(name)
 		if value:
@@ -937,8 +1192,15 @@ def install_agent() -> None:
 			log=escape(str(LOG_PATH)),
 		)
 	)
+	secret = next((name for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if name in settings), None)
+	if secret:
+		# The plist would otherwise be world-readable, and it now holds a key.
+		PLIST_PATH.chmod(0o600)
 	print(f"Wrote {PLIST_PATH}")
 	print(f"State:  {settings['WATER_STATE_FILE']}")
+	print(f"Replies: {llm_status()}")
+	if secret:
+		print(f"        {secret} was copied into the plist, so it is now chmod 600")
 	print(f"Start:  launchctl bootstrap gui/$(id -u) {PLIST_PATH}")
 	print(f"Stop:   launchctl bootout gui/$(id -u)/{PLIST_LABEL}")
 	print(f"Log:    {LOG_PATH}")
@@ -1004,6 +1266,9 @@ def doctor() -> None:
 	if agent_phone and os.getenv("WATER_PHONE") and agent_phone != os.getenv("WATER_PHONE"):
 		check(False, f"the LaunchAgent texts {agent_phone}, not the {os.getenv('WATER_PHONE')} set here")
 
+	print(f"        replies {llm_status()}")
+	if LLM_MODE != "off" and anthropic is None:
+		print("        pip install anthropic to have Claude read them instead")
 	print(f"        state file {STATE_PATH.resolve()}")
 	state = load_state(quarantine=False)
 	if state is None:

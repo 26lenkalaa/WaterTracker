@@ -1,0 +1,3 @@
+# Optional. Installs the Claude client so replies are interpreted by the model
+# instead of by pattern matching; the tracker runs without it.
+anthropic>=1.0
