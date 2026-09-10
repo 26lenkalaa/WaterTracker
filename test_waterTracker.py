@@ -8,6 +8,7 @@ Claude client is a stand-in that records what it was asked.
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -15,7 +16,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -149,6 +150,81 @@ class DetectIntentTest(unittest.TestCase):
 				self.assertIsNone(wt.detect_intent(text))
 
 
+class FastPathTest(unittest.TestCase):
+	"""Which replies are answered without a round trip, and which are not."""
+
+	def test_answers_messages_that_are_only_an_amount(self):
+		cases = {
+			"28 oz": 28.0,
+			"16": 16.0,
+			"500ml": 16.9,
+			"2 cups": 16.0,
+			"a glass": 8.0,
+			"had 28 oz": 28.0,
+			"just drank a bottle": 16.9,
+			"another glass": 8.0,
+			"i had 16 oz and a cup": 24.0,
+			"finished my nalgene": 32.0,
+			# A named container is just a units lookup, fraction included.
+			"like half a hydroflask": 16.0,
+		}
+		for text, expected in cases.items():
+			with self.subTest(text=text):
+				self.assertAlmostEqual(wt.fast_path_ounces(text), expected, places=1)
+
+	def test_defers_anything_carrying_more_than_an_amount(self):
+		# Each of these either means something beyond the amount, or means the
+		# opposite of what the number alone suggests. The model has to see them.
+		for text in (
+			"had 20 oz, you can stop for today",   # also a pause
+			"haven't had my 16 oz yet",            # a negation
+			"16 oz of coffee",                     # an unknown word
+			"the bottle is empty",                 # not a drink
+			"undo that 16 oz",                     # an undo
+			"set my goal to 120 oz",               # a goal change
+			"how am i doing",                      # no amount at all
+			"done",                                # a guess, not an amount
+			"i'll drink some at 16:00",            # a time, not an amount
+			"half a glass of orange juice",        # an unknown word
+			# Every word here is filler, but "total" also reads as a request
+			# for today's total, so only the intent check defers it. Without
+			# that check this logs 16 oz in answer to a question.
+			"16 oz total",
+		):
+			with self.subTest(text=text):
+				self.assertIsNone(wt.fast_path_ounces(text))
+
+	def test_no_negation_word_is_treated_as_filler(self):
+		# The negation guard and the whitelist overlap today, which is why the
+		# guard cannot be caught by a message alone. This pins the overlap: add
+		# any of these to the filler list and the guard becomes the only thing
+		# standing between "no 16 oz" and a logged 16 oz.
+		for word in ("not", "no", "didnt", "havent", "hasnt", "wont", "nope", "forgot"):
+			with self.subTest(word=word):
+				self.assertNotIn(word, wt.FAST_PATH_WORDS)
+
+	def test_negation_defers_even_when_every_word_is_allowed(self):
+		previous = wt.FAST_PATH_WORDS
+		wt.FAST_PATH_WORDS = previous | {"not", "havent", "yet"}
+		self.addCleanup(setattr, wt, "FAST_PATH_WORDS", previous)
+		for text in ("havent had 16 oz yet", "not 16 oz"):
+			with self.subTest(text=text):
+				self.assertIsNone(wt.fast_path_ounces(text))
+
+	def test_the_switch_turns_it_off(self):
+		previous = wt.FAST_PATH
+		wt.FAST_PATH = False
+		self.addCleanup(setattr, wt, "FAST_PATH", previous)
+		self.assertIsNone(wt.fast_path_ounces("28 oz"))
+
+	def test_it_never_disagrees_with_the_pattern_matcher(self):
+		# The fast path is only a shortcut, so where it answers at all it has
+		# to give the same ounces the slower path would have.
+		for text in ("28 oz", "2 cups", "a glass", "500ml", "i had 16 oz and a cup"):
+			with self.subTest(text=text):
+				self.assertEqual(wt.fast_path_ounces(text), wt.extract_ounces(text))
+
+
 class MessageTimeTest(unittest.TestCase):
 	def test_reads_both_second_and_nanosecond_timestamps(self):
 		when = datetime(2026, 9, 9, 12, 0).timestamp()
@@ -200,6 +276,29 @@ class InstallTest(unittest.TestCase):
 		os.environ.pop("ANTHROPIC_API_KEY", None)
 		settings = self.install_with(WATER_PHONE="+15551234567")
 		self.assertNotIn("ANTHROPIC_API_KEY", settings)
+
+	def stub_check(self, working, how):
+		previous = wt.llm_check
+		wt.llm_check = lambda: (working, how)
+		self.addCleanup(setattr, wt, "llm_check", previous)
+
+	def test_a_key_that_does_not_work_is_called_out(self):
+		# install is the one moment credentials get set, so a broken one has to
+		# be obvious here rather than discovered from the agent log hours later.
+		self.stub_check(False, "pattern matching: credentials rejected, set ANTHROPIC_API_KEY")
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			self.install_with(WATER_PHONE="+15551234567", ANTHROPIC_API_KEY="sk-ant-...")
+		output = printed.getvalue()
+		self.assertIn("credentials rejected", output)
+		self.assertIn("re-run install", output, "wrote a bad key with no warning")
+
+	def test_a_working_key_is_not_second_guessed(self):
+		self.stub_check(True, "read by claude-haiku-4-5, with pattern matching as the fallback")
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			self.install_with(WATER_PHONE="+15551234567")
+		self.assertNotIn("re-run install", printed.getvalue())
 
 
 class HandleTest(unittest.TestCase):
@@ -287,13 +386,19 @@ class StateTest(TrackerTestCase):
 
 
 class FakeClient:
-	"""Stands in for anthropic.Anthropic, recording what it was asked."""
+	"""Stands in for anthropic.Anthropic, recording what it was asked.
 
-	def __init__(self, outcome):
+	Interpretation and the startup probe get separate outcomes, since the
+	point of the probe is to fail on its own before any message arrives.
+	"""
+
+	def __init__(self, outcome=None, count_outcome=None):
 		self.outcome = outcome
+		self.count_outcome = count_outcome or SimpleNamespace(input_tokens=3)
 		self.requests = []
+		self.counts = []
 		self.options = []
-		self.messages = SimpleNamespace(create=self._create)
+		self.messages = SimpleNamespace(create=self._create, count_tokens=self._count)
 
 	def with_options(self, **options):
 		self.options.append(options)
@@ -305,25 +410,61 @@ class FakeClient:
 			raise self.outcome
 		return self.outcome
 
+	def _count(self, **request):
+		self.counts.append(request)
+		if isinstance(self.count_outcome, Exception):
+			raise self.count_outcome
+		return self.count_outcome
 
-def fake_sdk(client):
-	"""A stand-in for the anthropic module: exception classes and a factory."""
 
-	class BadRequestError(Exception):
-		message = "bad request"
+def fake_sdk(client, broken=False):
+	"""A stand-in for the anthropic module: exception classes and a factory.
 
-	class APIStatusError(Exception):
+	The classes mirror the real hierarchy, which the `except` chains depend on:
+	every status error descends from APIStatusError, and a timeout is a kind of
+	connection error. A flat set of siblings would let a wrongly ordered chain
+	pass its tests — catching APIStatusError first silently swallows the 401
+	and 404 cases that have something specific to say.
+
+	With broken=True the factory itself raises, standing in for an SDK that
+	cannot be constructed at all.
+	"""
+
+	class AnthropicError(Exception):
+		pass
+
+	class APIError(AnthropicError):
+		pass
+
+	class APIStatusError(APIError):
 		status_code = 503
 
+	class APIConnectionError(APIError):
+		pass
+
+	class APITimeoutError(APIConnectionError):
+		pass
+
+	def status(name, code, message=""):
+		return type(name, (APIStatusError,), {"status_code": code, "message": message or name})
+
+	def factory(**kwargs):
+		if broken:
+			raise RuntimeError("no credentials")
+		return client
+
 	return SimpleNamespace(
-		Anthropic=lambda **kwargs: client,
-		AuthenticationError=type("AuthenticationError", (Exception,), {}),
-		NotFoundError=type("NotFoundError", (Exception,), {}),
-		BadRequestError=BadRequestError,
-		RateLimitError=type("RateLimitError", (Exception,), {}),
-		APITimeoutError=type("APITimeoutError", (Exception,), {}),
-		APIConnectionError=type("APIConnectionError", (Exception,), {}),
+		Anthropic=factory,
+		AnthropicError=AnthropicError,
+		APIError=APIError,
 		APIStatusError=APIStatusError,
+		APIConnectionError=APIConnectionError,
+		APITimeoutError=APITimeoutError,
+		BadRequestError=status("BadRequestError", 400, "bad request"),
+		AuthenticationError=status("AuthenticationError", 401),
+		PermissionDeniedError=status("PermissionDeniedError", 403),
+		NotFoundError=status("NotFoundError", 404),
+		RateLimitError=status("RateLimitError", 429),
 	)
 
 
@@ -335,8 +476,8 @@ def fake_answer(payload, stop_reason="end_turn"):
 	)
 
 
-class LlmPlanTest(unittest.TestCase):
-	"""The interpretation call: request shape, validation, and failure modes."""
+class LlmTestCase(unittest.TestCase):
+	"""Swaps in a stand-in SDK, and puts the module globals back afterwards."""
 
 	def setUp(self):
 		self.previous = (wt.LLM_MODE, wt.anthropic, wt._llm_client, wt._llm_broken)
@@ -348,15 +489,19 @@ class LlmPlanTest(unittest.TestCase):
 	def restore(self):
 		wt.LLM_MODE, wt.anthropic, wt._llm_client, wt._llm_broken = self.previous
 
-	def install(self, outcome):
+	def install(self, outcome=None, count_outcome=None, broken=False):
 		# Resetting the cached client matters: without it a second install in
 		# one test silently keeps answering with the first fake's response,
 		# which made every payload after the first in a loop vacuous.
 		wt._llm_client = None
 		wt._llm_broken = False
-		client = FakeClient(outcome)
-		wt.anthropic = fake_sdk(client)
+		client = FakeClient(outcome, count_outcome)
+		wt.anthropic = fake_sdk(client, broken=broken)
 		return client
+
+
+class LlmPlanTest(LlmTestCase):
+	"""The interpretation call: request shape, validation, and failure modes."""
 
 	def test_reads_a_valid_answer(self):
 		self.install(fake_answer({"action": "log", "ounces": 24, "goal_oz": None, "chat": None}))
@@ -374,8 +519,30 @@ class LlmPlanTest(unittest.TestCase):
 		self.assertIn("water-intake tracker", request["system"])
 		self.assertEqual(request["output_config"]["format"]["type"], "json_schema")
 		self.assertEqual(request["output_config"]["format"]["schema"], wt.PLAN_SCHEMA)
-		self.assertEqual(request["output_config"]["effort"], "low")
 		self.assertEqual(client.options[0]["timeout"], wt.LLM_TIMEOUT)
+		# Off, so a timeout is not silently doubled while someone waits.
+		self.assertEqual(client.options[0]["max_retries"], 0)
+
+	def test_no_thinking_or_effort_is_asked_for_by_default(self):
+		# The default model rejects output_config.effort outright, and asking
+		# for thinking on a nine-way classification only adds delay.
+		client = self.install(fake_answer({"action": "status", "ounces": None, "goal_oz": None, "chat": None}))
+		wt.llm_plan("how am i doing")
+
+		request = client.requests[0]
+		self.assertNotIn("effort", request["output_config"])
+		self.assertNotIn("thinking", request)
+
+	def test_effort_is_sent_when_configured_for_a_model_that_takes_it(self):
+		self.patch_effort("low")
+		client = self.install(fake_answer({"action": "status", "ounces": None, "goal_oz": None, "chat": None}))
+		wt.llm_plan("how am i doing")
+		self.assertEqual(client.requests[0]["output_config"]["effort"], "low")
+
+	def patch_effort(self, value):
+		previous = wt.LLM_EFFORT
+		wt.LLM_EFFORT = value
+		self.addCleanup(setattr, wt, "LLM_EFFORT", previous)
 
 	def test_turned_off_by_configuration_without_calling_out(self):
 		client = self.install(fake_answer({"action": "status", "ounces": None, "goal_oz": None, "chat": None}))
@@ -421,17 +588,118 @@ class LlmPlanTest(unittest.TestCase):
 		self.assertTrue(wt.llm_ready(), "gave up after one timeout")
 
 	def test_every_failure_mode_returns_none(self):
-		sdk = fake_sdk(FakeClient(None))
 		for name in (
 			"AuthenticationError", "NotFoundError", "BadRequestError", "RateLimitError",
 			"APITimeoutError", "APIConnectionError", "APIStatusError",
 		):
 			with self.subTest(error=name):
-				wt._llm_client = None
-				wt._llm_broken = False
 				client = self.install(None)
 				client.outcome = getattr(wt.anthropic, name)("boom")
 				self.assertIsNone(wt.llm_plan("16 oz"))
+
+	def test_an_unexpected_error_returns_none_rather_than_escaping(self):
+		# The SDK raises a bare TypeError at request time when it cannot
+		# resolve credentials. Letting that out would leave the reply
+		# unanswered with its row already consumed.
+		client = self.install(None)
+		client.outcome = TypeError("could not resolve authentication method")
+		self.assertIsNone(wt.llm_plan("16 oz"))
+		self.assertFalse(wt.llm_ready(), "kept calling an SDK that cannot authenticate")
+
+
+class LlmCheckTest(LlmTestCase):
+	"""The startup probe: does it report what will actually happen?"""
+
+	def test_a_working_setup_names_the_model(self):
+		self.install()
+		working, how = wt.llm_check()
+		self.assertTrue(working)
+		self.assertIn(wt.LLM_MODEL, how)
+
+	def test_probes_by_counting_tokens_rather_than_sending_a_message(self):
+		# Counting authenticates exactly like a real request but is free, and
+		# must not be mistaken for interpretation work.
+		client = self.install()
+		wt.llm_check()
+		self.assertEqual(len(client.counts), 1)
+		self.assertEqual(client.counts[0]["model"], wt.LLM_MODEL)
+		self.assertEqual(client.requests, [], "spent a real message on the probe")
+		self.assertEqual(client.options[0]["timeout"], wt.LLM_TIMEOUT)
+
+	def test_switched_off_is_a_pass_without_a_round_trip(self):
+		client = self.install()
+		wt.LLM_MODE = "off"
+		working, how = wt.llm_check()
+		self.assertTrue(working, "reported a configured choice as a fault")
+		self.assertIn("WATER_LLM=off", how)
+		self.assertEqual(client.counts, [], "probed the API while switched off")
+
+	def test_a_missing_package_is_a_failure(self):
+		wt.anthropic = None
+		working, how = wt.llm_check()
+		self.assertFalse(working)
+		self.assertIn("not installed", how)
+
+	def test_each_rejection_is_reported_with_its_remedy(self):
+		# The specific cases are all subclasses of APIStatusError, so this also
+		# pins the order of the except chain: catch the base first and every
+		# one of these degrades to a bare status code with no remedy.
+		for name, expected in (
+			("AuthenticationError", "ANTHROPIC_API_KEY"),
+			("PermissionDeniedError", "permission"),
+			("NotFoundError", wt.LLM_MODEL),
+			("APIConnectionError", "cannot reach"),
+			("APITimeoutError", "cannot reach"),
+			("APIStatusError", "503"),
+		):
+			with self.subTest(error=name):
+				client = self.install()
+				client.count_outcome = getattr(wt.anthropic, name)("boom")
+				working, how = wt.llm_check()
+				self.assertFalse(working)
+				self.assertIn(expected, how)
+				if name != "APIStatusError":
+					self.assertNotIn("API error", how, "fell through to the generic branch")
+
+	def test_no_credentials_anywhere_gets_the_remedy_not_the_traceback(self):
+		# The SDK signals this with a bare TypeError at request time, and it is
+		# the ordinary case: nothing exported. Reporting the type name here
+		# would bury the one thing worth saying.
+		client = self.install()
+		client.count_outcome = TypeError(
+			"Could not resolve authentication method. Expected one of api_key, "
+			"auth_token, or credentials to be set."
+		)
+		working, how = wt.llm_check()
+		self.assertFalse(working)
+		self.assertIn("ANTHROPIC_API_KEY", how)
+		self.assertNotIn("TypeError", how)
+
+	def test_an_unexpected_error_is_still_a_clean_failure(self):
+		client = self.install()
+		client.count_outcome = ValueError("something new")
+		working, how = wt.llm_check()
+		self.assertFalse(working)
+		self.assertIn("ValueError", how)
+
+	def test_a_client_that_cannot_be_built_is_reported_once(self):
+		# llm_client would otherwise print its own fallback notice, which the
+		# probe is about to phrase better itself.
+		self.install(broken=True)
+		captured = io.StringIO()
+		with redirect_stdout(captured):
+			working, how = wt.llm_check()
+		self.assertFalse(working)
+		self.assertIn("no credentials", how)
+		self.assertEqual(captured.getvalue(), "", "printed over its own report")
+
+	def test_a_failed_probe_leaves_interpretation_in_play(self):
+		# A probe can fail for reasons a message never will, so a bad network
+		# moment at startup must not switch Claude off for the whole run.
+		client = self.install()
+		client.count_outcome = wt.anthropic.APIConnectionError("offline")
+		self.assertFalse(wt.llm_check()[0])
+		self.assertTrue(wt.llm_ready(), "gave up on Claude over one failed probe")
 
 
 class FollowPlanTest(TrackerTestCase):
@@ -479,11 +747,20 @@ class FollowPlanTest(TrackerTestCase):
 		self.tracker.handle_reply("just had a couple glasses")
 		self.assertEqual(self.tracker.total(), 16, "patterns did not take over")
 
+	def test_a_bare_amount_never_reaches_the_model(self):
+		asked = []
+		self.patch(wt, "llm_plan", lambda text: asked.append(text) or None)
+		self.tracker.handle_reply("28 oz")
+		self.assertEqual(asked, [], "spent a round trip on a plain amount")
+		self.assertEqual(self.tracker.total(), 28)
+
 	def test_the_model_sees_the_message_as_typed(self):
+		# Deliberately not a bare amount: that would be answered by the fast
+		# path and never reach the model at all.
 		seen = []
 		self.patch(wt, "llm_plan", lambda text: seen.append(text) or None)
-		self.tracker.handle_reply("  Had TWO Cups  ")
-		self.assertEqual(seen, ["Had TWO Cups"], "case and padding should survive")
+		self.tracker.handle_reply("  Finished My Coffee  ")
+		self.assertEqual(seen, ["Finished My Coffee"], "case and padding should survive")
 
 
 class MarkerTest(TrackerTestCase):
@@ -898,6 +1175,160 @@ class RemindTest(TrackerTestCase):
 		self.tracker.add(self.tracker.goal, "test")
 		self.tracker.maybe_remind()
 		self.assertEqual(self.sent, [], "nudged after the goal was met")
+
+
+class FollowUpTest(TrackerTestCase):
+	"""The second text when a nudge goes unanswered."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "WAKE_HOUR", 0)
+		self.patch(wt, "SLEEP_HOUR", 24)
+
+	def waited(self, minutes):
+		"""Backdate the outstanding nudge as though it had gone unanswered."""
+		self.tracker.state["awaiting_reply_since"] = time.time() - minutes * 60
+
+	def chases(self):
+		return [text for text in self.sent if "no reply since" in text]
+
+	def test_a_nudge_starts_the_clock_on_a_reply(self):
+		# Asserted on the state rather than through waited(), which sets this
+		# field itself and would hide a nudge that never armed anything.
+		self.assertIsNone(self.tracker.state["awaiting_reply_since"])
+		self.tracker.maybe_remind()
+		armed = self.tracker.state["awaiting_reply_since"]
+		self.assertIsNotNone(armed, "a nudge left nothing awaiting a reply")
+		self.assertGreaterEqual(armed, time.time() - 5)
+		self.assertFalse(self.tracker.state["followed_up"])
+
+	def test_chases_a_nudge_that_went_unanswered(self):
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.chases()), 1)
+		self.assertIn("Reply with an amount", self.sent[-1])
+
+	def test_stays_quiet_until_the_hour_is_up(self):
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN - 1)
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased before the wait was over")
+
+	def test_chases_only_once(self):
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		for _ in range(4):
+			self.tracker.maybe_remind()
+		self.assertEqual(len(self.chases()), 1, "a chase became a chain")
+
+	def test_any_reply_cancels_the_chase(self):
+		# The reply lands after a full hour of silence, so the chase was due
+		# and was called off rather than never being armed.
+		for reply in ("status", "not yet", "asdf gibberish"):
+			with self.subTest(reply=reply):
+				self.sent.clear()
+				self.tracker.state["awaiting_reply_since"] = None
+				self.tracker.state["last_nudge_at"] = 0
+				self.tracker.maybe_remind()
+				self.waited(wt.FOLLOWUP_MIN)
+				self.assertTrue(self.tracker.follow_up_due(), "the chase was never armed")
+				self.tracker.handle_reply(reply)
+				self.tracker.maybe_remind()
+				self.assertEqual(self.chases(), [], "chased someone who had replied")
+
+	def test_a_reply_clears_the_wait_even_when_unparseable(self):
+		self.tracker.maybe_remind()
+		self.tracker.handle_reply("asdf gibberish")
+		self.assertIsNone(self.tracker.state["awaiting_reply_since"])
+
+	def test_the_next_nudge_rearms_the_chase(self):
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.chases()), 1)
+
+		# Past any pace-adjusted gap, so the paced nudge comes round again.
+		self.tracker.state["last_nudge_at"] = time.time() - wt.INTERVAL_MIN * 60 * 10
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.chases()), 2, "the second nudge was never chased")
+
+	def test_a_due_nudge_wins_over_a_chase(self):
+		# Both are due at once when the gap has tightened to the follow-up
+		# time. The nudge carries fresh progress, so it should be the one sent
+		# and it should not be doubled up with a chase.
+		self.tracker.maybe_remind()
+		self.tracker.state["last_nudge_at"] = time.time() - wt.INTERVAL_MIN * 60 * 10
+		self.waited(wt.FOLLOWUP_MIN * 5)
+		self.sent.clear()
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.sent), 1)
+		self.assertEqual(self.chases(), [], "sent a chase on top of a nudge")
+
+	def test_it_survives_a_restart(self):
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		self.tracker.save()
+
+		restarted = wt.WaterTracker()
+		restarted.send = self.sent.append
+		restarted.maybe_remind()
+		self.assertEqual(len(self.chases()), 1, "a restart forgot the unanswered nudge")
+
+		# And the restart must not re-chase what it already chased.
+		restarted.save()
+		again = wt.WaterTracker()
+		again.send = self.sent.append
+		again.maybe_remind()
+		self.assertEqual(len(self.chases()), 1, "a restart chased the same nudge twice")
+
+	def arm_a_chase(self):
+		"""Nudge, then let a full hour of silence pass, leaving a chase due."""
+		self.tracker.maybe_remind()
+		self.waited(wt.FOLLOWUP_MIN)
+		self.sent.clear()
+		self.assertTrue(self.tracker.follow_up_due(), "the chase was never armed")
+
+	def test_no_chase_while_paused(self):
+		self.arm_a_chase()
+		self.tracker.state["paused_on"] = self.tracker.today()
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased while paused")
+
+	def test_no_chase_once_the_goal_is_met(self):
+		self.arm_a_chase()
+		self.tracker.add(self.tracker.goal, "test")
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased after the goal was met")
+
+	def test_no_chase_outside_the_waking_window(self):
+		self.arm_a_chase()
+		# A window that starts an hour from now, so it excludes the present
+		# hour whatever the clock says, rather than skipping the test at 23:00.
+		hour = datetime.now().hour
+		self.patch(wt, "WAKE_HOUR", (hour + 1) % 24)
+		self.patch(wt, "SLEEP_HOUR", (hour + 2) % 24)
+		self.assertFalse(self.tracker.awake(), "the window still contains now")
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased outside the waking window")
+
+	def test_zero_turns_it_off(self):
+		self.patch(wt, "FOLLOWUP_MIN", 0)
+		self.tracker.maybe_remind()
+		self.waited(600)
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased with follow-ups switched off")
+
+	def test_the_chase_reports_the_wait_and_the_progress(self):
+		self.tracker.add(32, "test")
+		self.tracker.maybe_remind()
+		self.waited(75)
+		self.tracker.maybe_remind()
+		chase = self.chases()[0]
+		self.assertIn("75 min ago", chase)
+		self.assertIn(f"32/{self.tracker.goal:g} oz", chase)
 
 
 if __name__ == "__main__":

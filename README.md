@@ -92,8 +92,10 @@ python3 waterTracker.py install    # write the LaunchAgent
 
 ### Texting it back
 
-Text it however you like. Claude reads each message and reports what it meant;
-if it's unreachable, pattern matching covers the phrasings below.
+Text it however you like. A message that is nothing but an amount is answered
+straight away without asking anything; everything else goes to Claude, which
+reports what it meant; and if Claude is unreachable, pattern matching covers
+the phrasings below.
 
 | You text | It does |
 |---|---|
@@ -132,31 +134,100 @@ All optional except the phone number.
 | `WATER_INTERVAL_MIN` | 120 | base spacing between nudges |
 | `WATER_WAKE_HOUR` | 8 | no nudges before this hour |
 | `WATER_SLEEP_HOUR` | 22 | no nudges after this hour |
-| `WATER_POLL_SECONDS` | 20 | how often replies are checked |
+| `WATER_POLL_SECONDS` | 3 | how often replies are checked |
 | `WATER_SEND_TIMEOUT` | 60 | seconds before a stuck send gives up |
 | `WATER_KEEP_DAYS` | 90 | how long history is kept |
 | `WATER_STALE_REPLY_MIN` | 60 | ignore replies older than this |
+| `WATER_FOLLOWUP_MIN` | 60 | chase an unanswered nudge after this long; `0` off |
 | `WATER_STATE_FILE` | `water_tracker_state.json` | where the log lives |
 | `WATER_DEFAULT_OZ` | 8 | what a bare "done" logs |
 | `ANTHROPIC_API_KEY` | — | enables Claude reading replies |
 | `WATER_LLM` | `auto` | `off` for pattern matching only |
-| `WATER_MODEL` | `claude-opus-5` | any Claude model |
-| `WATER_LLM_TIMEOUT` | 20 | seconds before falling back to patterns |
+| `WATER_MODEL` | `claude-haiku-4-5` | any Claude model |
+| `WATER_LLM_TIMEOUT` | 8 | seconds before falling back to patterns |
+| `WATER_EFFORT` | — | thinking depth; only for models that accept it |
+| `WATER_FAST_PATH` | `on` | `off` to send even bare amounts to Claude |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
 A fixed interval nudges the same whether you're 5 oz or 50 oz short.
+
+A nudge you never answer gets **one follow-up** an hour later, worded as a
+follow-up rather than a fresh nudge:
+
+```
+You  14:02   💧 Water break. █████░░░░░ 53/100 oz (54%)
+You  15:02   💧 Still █████░░░░░ 53/100 oz (54%) — no reply since I asked 60 min ago.
+              Reply with an amount to log it, or 'not yet'.
+```
+
+The usual way a reminder fails isn't disagreement — the text is read while
+you're doing something else and never answered, and with the gap at two hours
+that's a long silence. Any reply calls it off, including `status` or `not yet`:
+someone texting back has the phone in hand. It fires **once** per nudge, since
+a chain of them just trains you to ignore the whole thing.
+
+Two consequences of it sharing the schedule with the paced nudge. If a nudge
+comes due at the same moment, the nudge wins — you never get both at once, and
+the nudge carries fresher progress. And because the paced gap tightens to half
+the interval when you're far behind, at the defaults (120 min interval, 60 min
+follow-up) it's already nudging hourly, so the follow-up is what covers the
+wider gaps when you're near or ahead of pace. Either way the effect is a
+one-hour ceiling on silence after a text you didn't answer.
 
 ## How it works
 
 ```
 LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.app      (sending)
                                     ├─→ copy of chat.db ─→ sqlite3     (reading)
+                                    ├─→ bare amount? ─→ {log, ounces}  (fast path)
                                     ├─→ Claude ─→ {action, ounces}     (understanding)
                                     └─→ patterns ─→ {action, ounces}   (fallback)
                                               ↓
                                   water_tracker_state.json
 ```
+
+### How long a reply takes to come back
+
+Measured on this machine, for everything except the model call:
+
+| Stage | Cost |
+|---|---|
+| Waiting for the next poll | 0–3 s (avg 1.5 s) |
+| Change check (three `stat()` calls) | ~0 ms |
+| Copying `chat.db` + `-wal` (6.1 MB) and querying | 2.6 ms |
+| Bare amount, answered locally | ~0 ms |
+| Otherwise, one Claude call | not measured here — no credentials on this box |
+| `osascript` send | ≥36 ms |
+
+Everything local is milliseconds, so the wait used to be almost entirely the
+poll interval and the model. Three things follow from that:
+
+**The poll interval was the biggest single lever.** It was 20 s, so a reply sat
+unnoticed for an average of 10 s before any work started — and that was pure
+dead air, not work. A poll that finds nothing costs three `stat()` calls, and
+only a *changed* database gets copied, so dropping it to 3 s costs nothing
+measurable and removes ~8.5 s from every reply.
+
+**A bare amount doesn't need a model.** `28 oz` is 28 oz; there is nothing for
+Claude to add, and it was the most common reply in practice. Messages built
+only from amounts and filler are answered locally in microseconds. The check is
+a whitelist of the number words, the unit names, and a short filler list, so an
+unrecognised word defers to Claude — it can only ever be too cautious. Anything
+carrying more than an amount (`had 20 oz, you can stop for today`) still goes to
+the model, because the amount isn't the only thing it's asking for.
+
+**Worst case matters more than average.** The timeout was 20 s with one SDK
+retry, so an unreachable API meant up to 40 s of silence before the pattern
+matcher answered. Retries are now off for the interpretation call and the
+timeout is 8 s: a retry would double the wait for someone holding their phone,
+and the fallback is instant and already right most of the time.
+
+Two things deliberately *not* done. **Prompt caching** doesn't apply: the
+system prompt and schema come to ~544 tokens, under the 4096-token minimum for
+Haiku 4.5, so it would silently never cache — and at that size the saving would
+be a few milliseconds anyway. **Streaming** doesn't help either, since the whole
+JSON object is needed before anything can be logged.
 
 - **Sending** shells out to `osascript`. The number and body are passed as
   `argv`, never interpolated into the script text, so a reply containing quotes
@@ -183,6 +254,9 @@ LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.ap
   all fall through to the pattern matching, which is why it's still there and
   still tested. Failures that would repeat every message (bad key, no model
   access) stop further calls for the run; a timeout or rate limit doesn't.
+  Unrecognised errors fall through too, deliberately: a reply's row in
+  `chat.db` is consumed when it's read, so an exception escaping this layer
+  would leave that message silently unanswered rather than answered literally.
 - **Self-chat** is the messy case. Texting your own number makes Messages log
   every outgoing text a second time as an *incoming* row, so the tracker can
   read its own reminders as replies and answer them forever. Two guards: each
@@ -194,7 +268,7 @@ LaunchAgent ─→ waterTracker.py run ─┬─→ osascript ─→ Messages.ap
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 83 tests, ~0.05s
+python3 -m unittest discover .        # 118 tests, ~0.06s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
@@ -215,9 +289,32 @@ plist permissions each breaks it. That exercise also found a bug in the tests
 themselves: a cached client made every case after the first in one loop
 vacuous.
 
+The startup check was mutated the same way: making it read the configuration
+instead of probing, spend a real message instead of counting tokens, report
+`WATER_LLM=off` as a fault, print over its own report, or let an unexpected
+error escape each fails a named test.
+
+The follow-up was mutated the same way: letting the chase repeat, dropping the
+arming on a nudge, ignoring the wait, ignoring `WATER_FOLLOWUP_MIN=0`, failing
+to cancel on a reply, sending a chase on top of a due nudge, or skipping the
+paused/asleep/goal-met guards each fails a named test. One mutation survived
+the first pass — dropping the arming — because the test helper that fast
+forwards the clock sets that same field, so it hid a nudge that armed nothing.
+That case now has its own test asserting the state directly.
+
+That exercise found a second weakness in the tests. The stand-in SDK's
+exceptions were flat siblings, but the real ones form a hierarchy — every
+status error descends from `APIStatusError`, and a timeout is a kind of
+connection error — so catching the base class too early would swallow the 401
+and 404 cases that have something specific to say, and the suite could not
+tell. The stand-in now mirrors the real hierarchy, and reordering either
+`except` chain fails.
+
 The Claude request shape is verified against the stand-in client, not the live
-API — model, JSON schema, effort and timeout are asserted, but no test proves
-the service accepts them.
+API — model, JSON schema, effort and timeout are asserted, and the startup
+check's arguments are checked against the installed SDK's signature, but no
+test proves the service accepts them. The one failure the check can't fake is
+success: verifying a *working* key needs a working key.
 
 ## Troubleshooting
 
@@ -228,13 +325,41 @@ state that makes silence *correct*, like a met goal or a pause.
 $ python3 waterTracker.py doctor
 Water tracker checkup
   ok    texting +1555..., from the LaunchAgent
+  ok    replies read by claude-opus-5, with pattern matching as the fallback
+        state file /Users/you/WaterTracker/water_tracker_state.json
+  ok    state file exists
   ok    this python can read Messages history, so replies are picked up
   ok    agent log clean since it started
   ok    LaunchAgent loaded
   ok    loop running (pid 10538)
   ok    no nudge due: it is outside 8:00-22:00
+        nothing awaiting a reply; follow-up after 60 min of silence
         today 0/100 oz
 ```
+
+That follow-up line reads as a fact rather than a check, because both states
+are normal. It's what explains a text that arrived off the interval — or one
+that didn't:
+
+```
+        nudge unanswered for 74 min, follow-up at 60 min (already sent)
+```
+
+The replies line is a live check, not a reading of the configuration: it counts
+the tokens of a one-word message, which authenticates exactly like a real
+request but costs nothing. This matters because the SDK builds a client happily
+with no credentials at all — so a key that is missing, expired, or scoped
+without access to the model looks fine until the first reply arrives and is
+quietly read literally. A `FAIL` here names the remedy:
+
+```
+  FAIL  replies pattern matching: no credentials, set ANTHROPIC_API_KEY
+  FAIL  replies pattern matching: credentials rejected, set ANTHROPIC_API_KEY
+  FAIL  replies pattern matching: no access to model 'claude-opus-5'
+```
+
+`WATER_LLM=off` is a pass, not a fault — it's a choice, and pattern matching
+still covers the phrasings listed under [Texting it back](#texting-it-back).
 
 | Symptom | Cause |
 |---|---|
@@ -243,8 +368,10 @@ Water tracker checkup
 | reminders arrive, replies ignored | Full Disk Access, per the notes above |
 | sends fail | handle isn't deliverable, or Automation was never approved |
 | log file empty | plist predates `PYTHONUNBUFFERED=1`; re-run `install` |
-| replies understood only literally | Claude is unreachable — `doctor` prints the mode and why |
+| replies understood only literally | Claude is unreachable — `doctor` checks for real and names the cause |
 | agent lost interpretation, terminal has it | launchd inherits nothing; re-run `install` with the key exported |
+| a second text an hour after the first | the follow-up; `WATER_FOLLOWUP_MIN=0` turns it off |
+| no follow-up ever arrives | you're replying (which cancels it), or far enough behind that the paced nudge gets there first |
 
 The agent logs to `~/Library/Logs/watertracker.log`.
 
@@ -271,9 +398,11 @@ reply you text is sent to the Anthropic API to be interpreted. Things to know:
 - **What it can and can't do:** it picks an action and estimates an amount. It
   never supplies the numbers you see; those are read from your log. The worst a
   misread can do is add one wrong entry, which `undo` removes.
-- **Cost:** one small call per message you send. It defaults to
-  `claude-opus-5`; `WATER_MODEL=claude-haiku-4-5` is cheaper and plenty for
-  this, and `WATER_LLM=off` turns the whole thing off.
+- **Cost:** one small call per message that isn't already a plain amount —
+  those are answered locally and cost nothing. It defaults to
+  `claude-haiku-4-5`, which is the cheapest and fastest model and plenty for
+  reading one short text; `WATER_MODEL` takes any Claude model, and
+  `WATER_LLM=off` turns the whole thing off.
 - **It is optional.** Everything works without it. That's deliberate: a
   hydration reminder that stops answering because a key expired isn't much of a
   reminder.

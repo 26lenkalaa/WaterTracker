@@ -82,10 +82,18 @@ GOAL_OZ = float(os.getenv("WATER_GOAL_OZ", "100"))
 INTERVAL_MIN = int(os.getenv("WATER_INTERVAL_MIN", "120"))
 WAKE_HOUR = int(os.getenv("WATER_WAKE_HOUR", "8"))
 SLEEP_HOUR = int(os.getenv("WATER_SLEEP_HOUR", "22"))
-POLL_SECONDS = int(os.getenv("WATER_POLL_SECONDS", "20"))
+# The dominant part of the wait for a reply, since everything after it is
+# milliseconds: a poll that finds nothing costs three stat() calls, and only a
+# changed database is copied. At 20s this was averaging 10s of dead air before
+# a reply was even noticed, which was more than the model ever took.
+POLL_SECONDS = int(os.getenv("WATER_POLL_SECONDS", "3"))
 SEND_TIMEOUT = int(os.getenv("WATER_SEND_TIMEOUT", "60"))
 KEEP_DAYS = int(os.getenv("WATER_KEEP_DAYS", "90"))
 STALE_REPLY_MIN = int(os.getenv("WATER_STALE_REPLY_MIN", "60"))
+# A nudge nobody answered gets one follow-up after this long. The usual way a
+# reminder fails is not disagreement: the text is read while doing something
+# else and never answered, and the next nudge is hours out. 0 turns it off.
+FOLLOWUP_MIN = int(os.getenv("WATER_FOLLOWUP_MIN", "60"))
 STATE_PATH = Path(os.getenv("WATER_STATE_FILE", "water_tracker_state.json"))
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
@@ -97,9 +105,17 @@ DEFAULT_SERVING_OZ = float(os.getenv("WATER_DEFAULT_OZ", "8"))
 # a pattern for it. Optional in every sense: the pattern matching below still
 # runs whenever the model is unreachable, so no key, no network, or no
 # package all degrade to the behaviour that existed before this.
-LLM_MODEL = os.getenv("WATER_MODEL", "claude-opus-5")
-LLM_TIMEOUT = float(os.getenv("WATER_LLM_TIMEOUT", "20"))
+LLM_MODEL = os.getenv("WATER_MODEL", "claude-haiku-4-5")
+# Short, because a person is waiting on the answer with their phone in hand and
+# the pattern matching below is instant. Retries are off for the same reason
+# (see llm_plan), so this is the whole worst case rather than a third of it.
+LLM_TIMEOUT = float(os.getenv("WATER_LLM_TIMEOUT", "8"))
 LLM_MODE = os.getenv("WATER_LLM", "auto").lower()  # auto or off
+# Thinking depth, for the models that take it. Left unset because Haiku 4.5 is
+# the default here and rejects output_config.effort with a 400; point
+# WATER_MODEL at an Opus or Sonnet model and WATER_EFFORT=low gets the same
+# cheap, shallow read this used to ask Opus for.
+LLM_EFFORT = os.getenv("WATER_EFFORT", "").strip().lower()
 # Claude writes the wording for conversation only. Every number in a reply
 # comes from the log, because a model that invents your intake is worse than
 # no tracker: it would be confidently wrong about the one thing being counted.
@@ -297,6 +313,44 @@ INTENT_PATTERNS = (
 )
 
 
+# Words that add nothing to "I drank an amount". Anything outside this set,
+# the number words, and the unit names sends the message to Claude, so the
+# list can only ever be too cautious — never too eager.
+FAST_PATH_FILLER = frozenset({
+	"i", "im", "ive", "just", "had", "have", "has", "got", "drank", "drink",
+	"drunk", "finished", "chugged", "downed", "of", "water", "and", "plus",
+	"more", "another", "about", "roughly", "around", "approx", "like", "maybe",
+	"so", "far", "total", "ok", "okay", "yep", "yes",
+})
+FAST_PATH_WORDS = FAST_PATH_FILLER | set(NUMBER_WORDS) | {unit for unit in UNITS if unit}
+FAST_PATH = os.getenv("WATER_FAST_PATH", "on").strip().lower() not in ("0", "off", "no")
+
+
+def fast_path_ounces(text: str) -> float | None:
+	"""Ounces from a message that says nothing but the amount, else None.
+
+	"28 oz" is 28 oz — there is nothing for a model to add, and asking anyway
+	spends a round trip on the most common reply there is while someone waits.
+	So a message built only from amounts and filler is answered here, and
+	everything else goes to Claude exactly as before.
+
+	Deliberately strict: an unrecognised word is enough to defer. "had 20 oz,
+	you can stop for today" has to reach the interpreter, because the amount is
+	not the only thing it is asking for.
+	"""
+	if not FAST_PATH:
+		return None
+	ounces = extract_ounces(text)
+	if ounces is None or amount_is_negated(text):
+		return None
+	# "drank" is the one intent that means no more than the amount already does.
+	if detect_intent(text) not in (None, "drank"):
+		return None
+	if any(word not in FAST_PATH_WORDS for word in re.findall(r"[a-z']+", text)):
+		return None
+	return ounces
+
+
 def quantity(raw: str) -> float:
 	"""A quantity written as digits, a fraction, or words: 'twenty five' is 25."""
 	if raw in NUMBER_WORDS:
@@ -448,21 +502,66 @@ def llm_ready() -> bool:
 	return LLM_MODE != "off" and anthropic is not None and not _llm_broken
 
 
-def llm_client():
-	"""The shared client, or None when there are no usable credentials.
+def llm_client(quiet: bool = False):
+	"""The shared client, or None when one cannot be built.
 
-	The SDK resolves an API key, an auth token, or an `ant auth login`
-	profile on its own, so this only has to notice that none of them worked.
+	The SDK resolves an API key, an auth token, or an `ant auth login` profile
+	on its own, so this only has to notice that none of them worked. Note that
+	construction succeeds with no credentials at all — that only surfaces on
+	the first request, which is why llm_check() exists.
 	"""
 	global _llm_client, _llm_broken
 	if _llm_client is None:
 		try:
 			_llm_client = anthropic.Anthropic(max_retries=1)
-		except Exception as error:  # no credentials anywhere
-			print(f"   Claude interpretation off ({error}); using pattern matching")
+		except Exception as error:
+			if not quiet:
+				print(f"   Claude interpretation off ({error}); using pattern matching")
 			_llm_broken = True
 			return None
 	return _llm_client
+
+
+def llm_check() -> tuple[bool, str]:
+	"""Whether interpretation will actually work, and how it is set up.
+
+	Counting tokens authenticates exactly like a real request but is free, so
+	this answers "will Claude read my replies" rather than the much weaker
+	"is a key configured". Worth the round trip: the SDK builds a client
+	happily with no credentials, so everything looks fine until the first
+	message arrives and quietly falls back.
+	"""
+	if LLM_MODE == "off":
+		return True, "pattern matching only (WATER_LLM=off)"
+	if anthropic is None:
+		return False, "pattern matching: the anthropic package is not installed"
+	client = llm_client(quiet=True)
+	if client is None:
+		return False, "pattern matching: no credentials the SDK can find"
+	try:
+		client.with_options(timeout=LLM_TIMEOUT).messages.count_tokens(
+			model=LLM_MODEL, messages=[{"role": "user", "content": "ping"}]
+		)
+	except anthropic.AuthenticationError:
+		return False, "pattern matching: credentials rejected, set ANTHROPIC_API_KEY"
+	except anthropic.PermissionDeniedError:
+		return False, "pattern matching: those credentials lack permission"
+	except anthropic.NotFoundError:
+		return False, f"pattern matching: no access to model {LLM_MODEL!r}"
+	except anthropic.APIConnectionError:
+		return False, "pattern matching: cannot reach the API right now"
+	except anthropic.APIStatusError as error:
+		return False, f"pattern matching: API error {error.status_code}"
+	except TypeError:
+		# What the SDK raises at request time when it could not resolve
+		# credentials from anywhere. This is the ordinary "no key set" case, so
+		# it gets the remedy rather than a stack-trace-shaped sentence. Only
+		# the arguments above reach it, and they are fixed and correct, so a
+		# TypeError here is about authentication and nothing else.
+		return False, "pattern matching: no credentials, set ANTHROPIC_API_KEY"
+	except Exception as error:
+		return False, f"pattern matching: {type(error).__name__}: {error}"
+	return True, f"read by {LLM_MODEL}, with pattern matching as the fallback"
 
 
 def sane_plan(plan: dict) -> dict | None:
@@ -499,16 +598,23 @@ def llm_plan(text: str) -> dict | None:
 	client = llm_client()
 	if client is None:
 		return None
+	# Structured output only. No thinking is asked for: reading one short text
+	# into one of nine actions is not reasoning work, the default model does not
+	# think unless told to, and a person is waiting on the answer. (The failure
+	# modes of switching thinking *off* — a tool call written into visible text,
+	# leaked tags — are specific to the Opus family and to tool use, and this
+	# call uses neither.) Retries are off too: the SDK would double the wait on
+	# a timeout, and falling back to pattern matching is faster than a retry.
+	output_config: dict = {"format": {"type": "json_schema", "schema": PLAN_SCHEMA}}
+	if LLM_EFFORT:
+		output_config["effort"] = LLM_EFFORT
 	try:
-		response = client.with_options(timeout=LLM_TIMEOUT).messages.create(
+		response = client.with_options(timeout=LLM_TIMEOUT, max_retries=0).messages.create(
 			model=LLM_MODEL,
 			max_tokens=512,
 			system=INTERPRETER_PROMPT,
 			messages=[{"role": "user", "content": text}],
-			# Reading one short text is not hard work, and the reply is waiting
-			# on it, so keep the thinking shallow rather than switching it off:
-			# disabling it on this model has its own failure modes.
-			output_config={"effort": "low", "format": {"type": "json_schema", "schema": PLAN_SCHEMA}},
+			output_config=output_config,
 		)
 	except anthropic.AuthenticationError:
 		print("   Claude interpretation failed: credentials rejected")
@@ -534,6 +640,14 @@ def llm_plan(text: str) -> dict | None:
 	except anthropic.APIStatusError as error:
 		print(f"   Claude interpretation failed: API error {error.status_code}")
 		return None
+	except Exception as error:
+		# Anything else, including the TypeError the SDK raises at request time
+		# when it cannot resolve credentials. Falling back is the whole promise
+		# of this layer, so nothing here may reach the caller: an exception
+		# would leave the message unanswered and its row already consumed.
+		print(f"   Claude interpretation failed: {type(error).__name__}: {error}")
+		_disable_llm()
+		return None
 	if response.stop_reason == "refusal":
 		print("   Claude declined to interpret that message")
 		return None
@@ -543,17 +657,6 @@ def llm_plan(text: str) -> dict | None:
 	except (StopIteration, json.JSONDecodeError, TypeError, AttributeError) as error:
 		print(f"   Claude interpretation unusable: {error}")
 		return None
-
-
-def llm_status() -> str:
-	"""One line on whether Claude is reading replies, and why not if it isn't."""
-	if LLM_MODE == "off":
-		return "pattern matching (WATER_LLM=off)"
-	if anthropic is None:
-		return "pattern matching (anthropic package not installed)"
-	if _llm_broken:
-		return "pattern matching (Claude unavailable this run)"
-	return f"read by {LLM_MODEL}, with pattern matching as the fallback"
 
 
 def _disable_llm() -> None:
@@ -620,6 +723,11 @@ class WaterTracker:
 		self.state.setdefault("sent_echoes", [])
 		self.state.setdefault("last_nudge_at", 0.0)
 		self.state.setdefault("pruned_on", None)
+		# When the outstanding nudge went out, or None once it has been
+		# answered. Kept in state so a restart mid-wait neither forgets an
+		# unanswered nudge nor follows up on one twice.
+		self.state.setdefault("awaiting_reply_since", None)
+		self.state.setdefault("followed_up", False)
 		# Echoes were a bare list of message strings before they carried a
 		# timestamp. Anything written in the old shape is long stale.
 		if not all(isinstance(echo, list) and len(echo) == 2 for echo in self.state["sent_echoes"]):
@@ -958,9 +1066,25 @@ class WaterTracker:
 
 	def handle_reply(self, body: str) -> None:
 		print(f"<- {body}")
+		# Any reply answers the outstanding nudge, whatever it turns out to
+		# mean. Someone texting 'status' or 'not yet' has the phone in hand, so
+		# a follow-up would be chasing a person who is plainly already there.
+		# Cleared before interpreting, so a message the tracker cannot parse
+		# still counts as having been answered.
+		self.state["awaiting_reply_since"] = None
+		self.save()
 		text = body.strip().lower()
 
-		# Claude first, since it reads sentences no pattern anticipates, and
+		# Answered without the network when the message is only an amount, so
+		# the commonest reply comes back in milliseconds instead of a round
+		# trip. Anything less clear-cut falls through to Claude below.
+		quick = fast_path_ounces(text)
+		if quick is not None:
+			print(f"   read as log, {quick:g} oz, without asking Claude")
+			self.log_reply(quick)
+			return
+
+		# Claude next, since it reads sentences no pattern anticipates, and
 		# the patterns below as the fallback when it cannot answer.
 		plan = llm_plan(body.strip())
 		if plan:
@@ -1045,6 +1169,43 @@ class WaterTracker:
 		share = deficit / self.goal if self.goal else 0.0
 		return INTERVAL_MIN * 60 * max(0.5, 1 - 2 * share)
 
+	def waiting_minutes(self) -> float | None:
+		"""How long the outstanding nudge has gone unanswered, if one has."""
+		waiting_since = self.state["awaiting_reply_since"]
+		if not waiting_since:
+			return None
+		return (time.time() - float(waiting_since)) / 60
+
+	def follow_up_due(self) -> bool:
+		"""Whether an unanswered nudge has earned its one follow-up."""
+		if not FOLLOWUP_MIN or self.state["followed_up"]:
+			return False
+		waiting = self.waiting_minutes()
+		return waiting is not None and waiting >= FOLLOWUP_MIN
+
+	def maybe_follow_up(self) -> None:
+		"""Chase a nudge nobody answered, once, then stay quiet.
+
+		Stopping after one is the point: a chain of them trains you to ignore
+		the whole thing, and the paced nudge is still coming. An explicit
+		'not yet' counts as an answer, so it lands here as silence rather than
+		as another prod.
+		"""
+		if not self.follow_up_due():
+			return
+		# Recorded before sending, like last_nudge_at below, so a failed send
+		# does not retry on every poll for the rest of the gap.
+		self.state["followed_up"] = True
+		self.save()
+		waiting = self.waiting_minutes() or 0
+		# Phrased as not having heard back, which is what is actually measured.
+		# "Nothing logged" would be a guess: the log can also be added to from
+		# the command line, without a reply.
+		self.send(
+			f"\U0001f4a7 Still {self.progress_line()} — no reply since I asked "
+			f"{waiting:.0f} min ago.\nReply with an amount to log it, or 'not yet'."
+		)
+
 	def maybe_remind(self) -> None:
 		if not self.awake():
 			return
@@ -1057,10 +1218,20 @@ class WaterTracker:
 		# thinking no time had passed and never nudge. Kept in state so a
 		# restart neither loses the spacing nor fires a duplicate.
 		if time.time() - float(self.state["last_nudge_at"]) < self.nudge_gap():
+			# Too early for the next nudge, which is exactly when chasing the
+			# last one is worth it: that gap is hours and the follow-up is an
+			# hour, so this fires in between rather than on top of a nudge.
+			self.maybe_follow_up()
 			return
 		# Recorded before sending, so a failed send waits instead of retrying
 		# every poll.
 		self.state["last_nudge_at"] = time.time()
+		# A nudge is unanswered by definition, and arms one follow-up. Armed on
+		# the attempt rather than on a confirmed send, matching last_nudge_at:
+		# send() reports failures without raising, and a nudge that never
+		# arrived is worth chasing too.
+		self.state["awaiting_reply_since"] = time.time()
+		self.state["followed_up"] = False
 		self.save()
 		nudge = NUDGES[int(time.time() // 60) % len(NUDGES)]
 		deficit = self.expected_by_now() - self.total()
@@ -1075,7 +1246,14 @@ class WaterTracker:
 			f"Water tracker running for {self.phone}. Goal {self.goal:g} oz, "
 			f"nudge every {INTERVAL_MIN} min between {WAKE_HOUR}:00 and {SLEEP_HOUR}:00."
 		)
-		print(f"Replies: {llm_status()}")
+		print(
+			f"Follow-up: one chase after {FOLLOWUP_MIN} min without a reply."
+			if FOLLOWUP_MIN
+			else "Follow-up: off (WATER_FOLLOWUP_MIN=0)."
+		)
+		# The real check, not just the configuration: this log is where anyone
+		# looks when replies come back read literally.
+		print(f"Replies: {llm_check()[1]}")
 		self.prime_replies()
 		while True:
 			try:
@@ -1198,9 +1376,16 @@ def install_agent() -> None:
 		PLIST_PATH.chmod(0o600)
 	print(f"Wrote {PLIST_PATH}")
 	print(f"State:  {settings['WATER_STATE_FILE']}")
-	print(f"Replies: {llm_status()}")
+	# The real check, not llm_status(): install is where credentials get set, so
+	# it is the worst possible place to print an unverified claim that Claude is
+	# reading replies. The key being written is the one in this environment, so
+	# this tests exactly what the agent will run with.
+	working, how = llm_check()
+	print(f"Replies: {how}")
 	if secret:
 		print(f"        {secret} was copied into the plist, so it is now chmod 600")
+	if not working:
+		print("        ^ fix that and re-run install, or the agent reads replies literally")
 	print(f"Start:  launchctl bootstrap gui/$(id -u) {PLIST_PATH}")
 	print(f"Stop:   launchctl bootout gui/$(id -u)/{PLIST_LABEL}")
 	print(f"Log:    {LOG_PATH}")
@@ -1266,9 +1451,10 @@ def doctor() -> None:
 	if agent_phone and os.getenv("WATER_PHONE") and agent_phone != os.getenv("WATER_PHONE"):
 		check(False, f"the LaunchAgent texts {agent_phone}, not the {os.getenv('WATER_PHONE')} set here")
 
-	print(f"        replies {llm_status()}")
+	working, how = llm_check()
+	check(working, f"replies {how}")
 	if LLM_MODE != "off" and anthropic is None:
-		print("        pip install anthropic to have Claude read them instead")
+		print("        python3 -m pip install anthropic to have Claude read them")
 	print(f"        state file {STATE_PATH.resolve()}")
 	state = load_state(quarantine=False)
 	if state is None:
@@ -1355,6 +1541,17 @@ def doctor() -> None:
 			minutes <= INTERVAL_MIN * 1.5,
 			f"last nudge {minutes:.0f} min ago, interval is {INTERVAL_MIN} min",
 		)
+	# Both states are normal, so they read as facts. Which one it is explains a
+	# text that arrived off the interval, or one that never came.
+	waiting = state.get("awaiting_reply_since")
+	if not FOLLOWUP_MIN:
+		print("        no follow-ups: WATER_FOLLOWUP_MIN=0")
+	elif not waiting:
+		print(f"        nothing awaiting a reply; follow-up after {FOLLOWUP_MIN} min of silence")
+	else:
+		held = (time.time() - float(waiting)) / 60
+		spent = " (already sent)" if state.get("followed_up") else ""
+		print(f"        nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{spent}")
 	print(f"        today {total:g}/{goal:g} oz")
 	print("Send a text with 'test' to confirm the Messages Automation prompt was approved.")
 
