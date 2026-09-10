@@ -75,6 +75,9 @@ STALE_REPLY_MIN = int(os.getenv("WATER_STALE_REPLY_MIN", "60"))
 STATE_PATH = Path(os.getenv("WATER_STATE_FILE", "water_tracker_state.json"))
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
+# A reply that only confirms drinking, with no amount, counts as this much.
+DEFAULT_SERVING_OZ = float(os.getenv("WATER_DEFAULT_OZ", "8"))
+
 # How long a message we sent stays recognisable as our own self-chat echo.
 # Comfortably more than a poll, or the echo would arrive after its record had
 # expired and get answered as though it were a reply.
@@ -90,7 +93,8 @@ MARKER = "\U0001f4a7"
 # nanoseconds on newer ones.
 APPLE_EPOCH = 978307200
 
-# Everything is normalised to fluid ounces.
+# Everything is normalised to fluid ounces. Containers are here because people
+# text what they drank out of, not a measurement: "a can", "my nalgene".
 UNITS = {
 	"": 1.0,
 	"oz": 1.0,
@@ -102,12 +106,38 @@ UNITS = {
 	"glasses": 8.0,
 	"bottle": 16.9,
 	"bottles": 16.9,
+	"water bottle": 16.9,
+	"water bottles": 16.9,
 	"ml": 0.033814,
 	"l": 33.814,
 	"liter": 33.814,
 	"liters": 33.814,
 	"litre": 33.814,
 	"litres": 33.814,
+	"sip": 1.5,
+	"sips": 1.5,
+	"gulp": 2.0,
+	"gulps": 2.0,
+	"mug": 10.0,
+	"mugs": 10.0,
+	"can": 12.0,
+	"cans": 12.0,
+	"pint": 16.0,
+	"pints": 16.0,
+	"tumbler": 20.0,
+	"tumblers": 20.0,
+	"shaker": 24.0,
+	"shakers": 24.0,
+	"nalgene": 32.0,
+	"nalgenes": 32.0,
+	"hydroflask": 32.0,
+	"hydro flask": 32.0,
+	"quart": 32.0,
+	"quarts": 32.0,
+	"jug": 64.0,
+	"jugs": 64.0,
+	"gallon": 128.0,
+	"gallons": 128.0,
 }
 
 # argv keeps the phone number and body out of the script source, so a reply
@@ -147,39 +177,141 @@ NUMBER_WORDS = {
 	"ten": 10.0,
 	"eleven": 11.0,
 	"twelve": 12.0,
+	"thirteen": 13.0,
+	"fourteen": 14.0,
+	"fifteen": 15.0,
+	"sixteen": 16.0,
+	"seventeen": 17.0,
+	"eighteen": 18.0,
+	"nineteen": 19.0,
+	"twenty": 20.0,
+	"thirty": 30.0,
+	"forty": 40.0,
+	"fifty": 50.0,
+	"sixty": 60.0,
+	"seventy": 70.0,
+	"eighty": 80.0,
+	"ninety": 90.0,
+	"hundred": 100.0,
 	"couple": 2.0,
+	"few": 3.0,
+	"several": 4.0,
+	"dozen": 12.0,
 	"half": 0.5,
+	"quarter": 0.25,
+	"three quarters": 0.75,
+	# Determiners standing in for "one of": "my nalgene", "another glass".
+	# "the" is deliberately absent — "the bottle is empty" is not a drink.
+	"my": 1.0,
+	"another": 1.0,
 }
+# "third" is deliberately absent: "my third bottle" means the third one, not a
+# third of one, and there is no way to tell those apart here.
+
+_TENS = ("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+_ONES = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
 # Longest alternative first, so "liters" wins over "l" and "cups" over "cup".
 _UNIT_RE = "|".join(sorted((unit for unit in UNITS if unit), key=len, reverse=True))
-_QTY_RE = r"\d+(?:\.\d+)?|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
-AMOUNT_RE = re.compile(rf"(?<![\w.])({_QTY_RE})\s*(?:of\s+)?(?:an?\s+)?({_UNIT_RE})\b")
+_WORDS_RE = "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
+_QTY_RE = (
+	# Compounds before single words, so "twenty five" is 25 and not 20 then 5.
+	rf"(?:{'|'.join(_ONES)}|a)[-\s]hundred(?:[-\s](?:{_WORDS_RE}))?"
+	rf"|(?:{'|'.join(_TENS)})[-\s](?:{'|'.join(_ONES)})"
+	r"|\d+\s*/\s*\d+"
+	r"|\d+(?:\.\d+)?"
+	rf"|{_WORDS_RE}"
+)
+AMOUNT_RE = re.compile(rf"(?<![\w.])({_QTY_RE})\s*(?:of\s+)?(?:an?\s+|my\s+|the\s+)?({_UNIT_RE})\b")
 BARE_NUMBER_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)(?![\w.])")
+# "a glass and a half": the half belongs to whatever unit came before it.
+AND_A_HALF_RE = re.compile(r"\band a half\b")
 MAX_LOG_OZ = 400.0
 
-# Checked in order, so "undo that" is an undo before "that" matters. Each is a
+# A negation ahead of the amount means it has not happened yet, so
+# "haven't had 16 oz" must not log 16 oz.
+NEGATION_RE = re.compile(r"\b(not|no|didn'?t|haven'?t|hasn'?t|won'?t|nope|forgot)\b")
+
+# Checked in order, so "undo that" is an undo before "that" matters, and
+# "I'm done for the day" stops reminders instead of logging a glass. Each is a
 # search, not a match, to catch commands wrapped in a sentence.
 INTENT_PATTERNS = (
-	("undo", re.compile(r"\b(undo|scratch that|(remove|delete|drop)( the)? last|never ?mind)\b")),
-	("week", re.compile(r"\b(week|weekly|last \d+ days|history|average)\b")),
-	("status", re.compile(r"\b(status|progress|total|how much|how many|where am i)\b|^\?+$")),
-	("pause", re.compile(r"\b(pause|snooze|quiet|shush|stop|leave me alone)\b")),
-	("resume", re.compile(r"\b(resume|unpause|start again|back on)\b|^(go|start)$")),
+	("undo", re.compile(
+		r"\b(undo|scratch that|(remove|delete|drop|take)( that| the)?( back| last| one)?"
+		r"|never ?mind|oops|my (bad|mistake)|that was wrong|wrong)\b"
+	)),
+	("week", re.compile(r"\b(week|weekly|last \d+ days|history|average|trend)\b")),
+	("status", re.compile(
+		r"\b(status|progress|total|how much|how many|where am i|how am i|how'?s my"
+		r"|on track|am i (good|behind|ahead|close)|what'?s my count)\b|^\?+$"
+	)),
+	("pause", re.compile(
+		r"\b(pause|snooze|quiet|shush|stop|leave me alone|going to bed|off to bed"
+		r"|done for (the day|today)|no more (today|tonight)|busy)\b"
+	)),
+	("resume", re.compile(
+		r"\b(resume|unpause|start again|back on|i'?m back|wake up)\b|^(go|start)$"
+	)),
+	# Softer than a pause: not now, ask me again next time round.
+	("later", re.compile(
+		r"\b(not yet|later|in a (bit|min|minute|sec|while)|hold on|soon|nope|no thanks"
+		r"|didn'?t|haven'?t|hasn'?t|forgot)\b|^(no|nah)$"
+	)),
+	# No amount given, just confirmation that some water happened.
+	("drank", re.compile(
+		r"\b(done|did it|drank|drinking|drunk|finished|chugged|gulped|sipped|refill(ed)?"
+		r"|topped off|another|one more|same again|got some|had some|yes|yep|yeah|yup|sure)\b"
+		r"|^[\U0001f44d✅\U0001f964\U0001f4a6\U0001f6b0]+$"
+	)),
 )
+
+
+def quantity(raw: str) -> float:
+	"""A quantity written as digits, a fraction, or words: 'twenty five' is 25."""
+	if raw in NUMBER_WORDS:
+		return NUMBER_WORDS[raw]
+	if "/" in raw:
+		top, _, bottom = raw.partition("/")
+		return float(top.strip()) / float(bottom.strip())
+	try:
+		return float(raw)
+	except ValueError:
+		pass
+	words = re.split(r"[-\s]+", raw)
+	if "hundred" in words:
+		# "two hundred" is 200, and a bare "hundred" is still 100.
+		split = words.index("hundred")
+		before = sum(NUMBER_WORDS.get(word, 0.0) for word in words[:split]) or 1.0
+		after = sum(NUMBER_WORDS.get(word, 0.0) for word in words[split + 1:])
+		return before * 100.0 + after
+	return sum(NUMBER_WORDS.get(word, 0.0) for word in words)
+
+
+def amount_is_negated(text: str) -> bool:
+	"""True when a negation comes before the first amount.
+
+	"haven't had 16 oz" is not 16 oz. A negation *after* the amount is a
+	different sentence — "had 16 oz but not the second bottle" still counts.
+	"""
+	amount = AMOUNT_RE.search(text) or BARE_NUMBER_RE.search(text)
+	negation = NEGATION_RE.search(text)
+	return bool(amount and negation and negation.start() < amount.start())
 
 
 def extract_ounces(text: str) -> float | None:
 	"""Total fluid ounces mentioned anywhere in a reply, else None.
 
-	Handles '16', '2 cups', '500 ml', 'half a liter', and sums every amount in
-	a sentence like 'a bottle at the gym and 500ml after'.
+	Handles '16', '2 cups', '500 ml', 'half a liter', 'twenty five ounces',
+	'3/4 of a bottle', 'a glass and a half', and sums every amount in a
+	sentence like 'a bottle at the gym and 500ml after'.
 	"""
 	body = text.strip().lower()
 	total = 0.0
+	last_unit = None
 	for match in AMOUNT_RE.finditer(body):
-		quantity = match.group(1)
-		scale = NUMBER_WORDS[quantity] if quantity in NUMBER_WORDS else float(quantity)
-		total += scale * UNITS[match.group(2)]
+		last_unit = match.group(2)
+		total += quantity(match.group(1)) * UNITS[last_unit]
+	if last_unit and AND_A_HALF_RE.search(body):
+		total += 0.5 * UNITS[last_unit]
 	if not total:
 		# No unit anywhere: trust a lone number ('16', 'just drank 16') but not
 		# one buried in a longer sentence, where it is usually a time or a date.
@@ -551,6 +683,12 @@ class WaterTracker:
 		self.save()
 		return "Reminders back on."
 
+	def snooze(self) -> str:
+		"""Push the next nudge out a full gap without pausing the whole day."""
+		self.state["last_nudge_at"] = time.time()
+		self.save()
+		return "No problem, I'll check back later."
+
 	def undo(self) -> str:
 		entries = self.entries()
 		if not entries:
@@ -600,7 +738,7 @@ class WaterTracker:
 			return
 
 		ounces = extract_ounces(text)
-		if ounces is not None:
+		if ounces is not None and not amount_is_negated(text):
 			# One sentence can do both: "had 20 oz, you can stop for today".
 			note = ""
 			if intent == "pause":
@@ -622,8 +760,19 @@ class WaterTracker:
 		if intent == "resume":
 			self.send(f"{self.resume()} {self.progress_line()}")
 			return
+		if intent == "later":
+			self.send(self.snooze())
+			return
+		if intent == "drank":
+			# No amount, just confirmation. A glass is the safest guess, and
+			# saying so invites a correction rather than hiding it.
+			self.log_reply(
+				DEFAULT_SERVING_OZ,
+				f" Counted as {DEFAULT_SERVING_OZ:g} oz — text an amount to be exact.",
+			)
+			return
 
-		self.send("Didn't catch an amount. Try 'had 2 cups', '500ml', or 'status'.")
+		self.send("Didn't catch an amount. Try 'had 2 cups', '500ml', 'done', or 'status'.")
 
 	# ----- reminders -----
 

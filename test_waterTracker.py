@@ -46,6 +46,37 @@ class ExtractOuncesTest(unittest.TestCase):
 			with self.subTest(text=text):
 				self.assertAlmostEqual(wt.extract_ounces(text), expected, places=1)
 
+	def test_reads_containers_word_numbers_and_fractions(self):
+		cases = {
+			"a can": 12.0,
+			"my nalgene": 32.0,
+			"another glass": 8.0,
+			"a few sips": 4.5,
+			"a couple gulps": 4.0,
+			"twenty five ounces": 25.0,
+			"fifteen oz": 15.0,
+			"two hundred ml": 6.8,
+			"3/4 of a bottle": 12.7,
+			"half my water bottle": 8.4,
+			"a glass and a half": 12.0,
+			"a pint": 16.0,
+		}
+		for text, expected in cases.items():
+			with self.subTest(text=text):
+				self.assertAlmostEqual(wt.extract_ounces(text), expected, places=1)
+
+	def test_a_negation_before_the_amount_is_not_a_log(self):
+		for text in ("i havent had 16 oz yet", "didn't drink my 2 cups", "no water yet, not even a glass"):
+			with self.subTest(text=text):
+				self.assertTrue(wt.amount_is_negated(text))
+		# A negation *after* the amount is a different sentence.
+		self.assertFalse(wt.amount_is_negated("had 16 oz but not the second bottle"))
+
+	def test_a_container_without_a_quantity_needs_a_possessive(self):
+		# "the bottle is empty" is a statement, not a drink.
+		self.assertIsNone(wt.extract_ounces("the bottle is empty"))
+		self.assertEqual(wt.extract_ounces("my bottle"), 16.9)
+
 	def test_ignores_text_without_a_usable_amount(self):
 		# The bare-number guard matters most here: a time or a count in a long
 		# sentence must not be logged as ounces.
@@ -80,6 +111,28 @@ class DetectIntentTest(unittest.TestCase):
 			"resume": "resume",
 			"go": "resume",
 			"turn it back on": "resume",
+		}
+		for text, expected in cases.items():
+			with self.subTest(text=text):
+				self.assertEqual(wt.detect_intent(text), expected)
+
+	def test_finds_casual_phrasings(self):
+		cases = {
+			"done": "drank",
+			"yep": "drank",
+			"just finished one": "drank",
+			"👍": "drank",
+			"not yet": "later",
+			"in a bit": "later",
+			"nah": "later",
+			"i'm going to bed": "pause",
+			"done for the day": "pause",  # a pause, not a glass
+			"how am i doing": "status",
+			"am i on track": "status",
+			"oops": "undo",
+			"my bad": "undo",
+			"what's the trend": "week",
+			"i'm back": "resume",
 		}
 		for text, expected in cases.items():
 			with self.subTest(text=text):
@@ -302,6 +355,27 @@ class HandleReplyTest(TrackerTestCase):
 		self.tracker.handle_reply("20 oz")
 		self.assertIn("Goal hit", self.sent[-1])
 
+	def test_confirming_without_an_amount_logs_a_default_serving(self):
+		self.tracker.handle_reply("done")
+		self.assertEqual(self.tracker.total(), wt.DEFAULT_SERVING_OZ)
+		self.assertIn("text an amount to be exact", self.sent[-1])
+
+	def test_an_amount_beats_a_bare_confirmation(self):
+		self.tracker.handle_reply("yep, drank 20 oz")
+		self.assertEqual(self.tracker.total(), 20)
+
+	def test_a_negated_amount_is_not_logged(self):
+		self.tracker.handle_reply("i havent had 16 oz yet")
+		self.assertEqual(self.tracker.total(), 0)
+		self.assertIn("check back later", self.sent[-1])
+
+	def test_not_yet_pushes_the_next_nudge_out_without_pausing(self):
+		before = self.tracker.state["last_nudge_at"]
+		self.tracker.handle_reply("not yet")
+		self.assertGreater(self.tracker.state["last_nudge_at"], before)
+		self.assertIsNone(self.tracker.state["paused_on"], "a snooze is not a pause")
+		self.assertEqual(self.tracker.total(), 0)
+
 	def test_unparseable_reply_asks_again_without_logging(self):
 		self.tracker.handle_reply("lol")
 		self.assertIn("Didn't catch", self.sent[-1])
@@ -428,10 +502,10 @@ class ReadRepliesTest(TrackerTestCase):
 		self.assertEqual(self.bodies(), [])
 
 	def test_our_own_message_read_back_late_is_still_not_a_reply(self):
-		# The echo record expires, but the copy stays in the database forever,
-		# and our own progress bar parses as an amount: "0/100 oz" is 100 oz.
-		own = f"{wt.MARKER} Water tracker is connected. ░░░░░░░░░░ 0/100 oz (0%)"
-		self.assertEqual(wt.extract_ounces(own), 100.0, "premise: this text parses as an amount")
+		# The echo record expires but the copy stays in the database forever,
+		# and our own text is full of amounts.
+		own = f"{wt.MARKER} Logged 16 oz. ████░░░░░░ 48/100 oz (48%) — 52 oz to go."
+		self.assertIsNotNone(wt.extract_ounces(own), "premise: this text parses as an amount")
 		self.add_message(own)
 		self.assertEqual(self.bodies(), [])
 
