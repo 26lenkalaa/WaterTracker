@@ -1303,16 +1303,45 @@ class FollowUpTest(TrackerTestCase):
 		self.tracker.maybe_remind()
 		self.assertEqual(self.chases(), [], "chased after the goal was met")
 
-	def test_no_chase_outside_the_waking_window(self):
-		self.arm_a_chase()
-		# A window that starts an hour from now, so it excludes the present
-		# hour whatever the clock says, rather than skipping the test at 23:00.
+	def shut_the_window(self):
+		"""A waking window that excludes now, whatever the clock says."""
 		hour = datetime.now().hour
 		self.patch(wt, "WAKE_HOUR", (hour + 1) % 24)
 		self.patch(wt, "SLEEP_HOUR", (hour + 2) % 24)
 		self.assertFalse(self.tracker.awake(), "the window still contains now")
+
+	def test_a_chase_outlives_the_window_that_started_it(self):
+		# The 21:50 case: the nudge went out inside the window and the chase
+		# falls after SLEEP_HOUR. Gating the whole of maybe_remind() on awake()
+		# meant no nudge in the final hour of the day could ever be chased.
+		self.arm_a_chase()
+		self.shut_the_window()
 		self.tracker.maybe_remind()
-		self.assertEqual(self.chases(), [], "chased outside the waking window")
+		self.assertEqual(len(self.chases()), 1, "a late chase was swallowed by the window")
+
+	def test_a_shut_window_still_blocks_a_fresh_nudge(self):
+		# The other half of that split: a chase may finish an exchange after
+		# hours, but nothing may start one.
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.state["awaiting_reply_since"] = None
+		self.shut_the_window()
+		self.tracker.maybe_remind()
+		self.assertEqual(self.sent, [], "nudged outside the waking window")
+
+	def test_a_chase_that_missed_its_moment_is_dropped(self):
+		# The Mac can sleep straight through the due moment. Waking up hours
+		# later to chase last night's nudge is noise, not diligence.
+		self.arm_a_chase()
+		self.waited(wt.FOLLOWUP_MIN + wt.FOLLOWUP_GRACE_MIN)
+		self.assertFalse(self.tracker.follow_up_due())
+		self.tracker.maybe_remind()
+		self.assertEqual(self.chases(), [], "chased about a question hours old")
+
+	def test_a_chase_inside_the_grace_still_goes(self):
+		self.arm_a_chase()
+		self.waited(wt.FOLLOWUP_MIN + wt.FOLLOWUP_GRACE_MIN - 1)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.chases()), 1, "a slightly late chase was dropped")
 
 	def test_zero_turns_it_off(self):
 		self.patch(wt, "FOLLOWUP_MIN", 0)

@@ -139,6 +139,7 @@ All optional except the phone number.
 | `WATER_KEEP_DAYS` | 90 | how long history is kept |
 | `WATER_STALE_REPLY_MIN` | 60 | ignore replies older than this |
 | `WATER_FOLLOWUP_MIN` | 60 | chase an unanswered nudge after this long; `0` off |
+| `WATER_FOLLOWUP_GRACE_MIN` | 30 | how late that chase may still be sent |
 | `WATER_STATE_FILE` | `water_tracker_state.json` | where the log lives |
 | `WATER_DEFAULT_OZ` | 8 | what a bare "done" logs |
 | `ANTHROPIC_API_KEY` | — | enables Claude reading replies |
@@ -166,6 +167,19 @@ you're doing something else and never answered, and with the gap at two hours
 that's a long silence. Any reply calls it off, including `status` or `not yet`:
 someone texting back has the phone in hand. It fires **once** per nudge, since
 a chain of them just trains you to ignore the whole thing.
+
+A chase is allowed to land **after** `WATER_SLEEP_HOUR`, which is the one place
+it ignores the quiet hours. Finishing an exchange the tracker started is not the
+same as starting one: a nudge at 21:50 is still owed its answer at 22:50. Only
+the *nudge* is gated on the waking window. Gating the whole check on it, as this
+first shipped, meant no nudge in the last hour of the day could ever be chased —
+a silent one-hour dead zone every evening.
+
+The other bound is staleness. A chase more than `WATER_FOLLOWUP_GRACE_MIN` late
+is dropped rather than sent, because the Mac can sleep straight through the
+moment one came due, and a chase arriving at breakfast asks after a question
+nobody remembers being asked. The morning nudge covers that instead. `doctor`
+says which of those happened rather than leaving you to guess.
 
 Two consequences of it sharing the schedule with the paced nudge. If a nudge
 comes due at the same moment, the nudge wins — you never get both at once, and

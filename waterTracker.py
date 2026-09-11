@@ -94,6 +94,11 @@ STALE_REPLY_MIN = int(os.getenv("WATER_STALE_REPLY_MIN", "60"))
 # reminder fails is not disagreement: the text is read while doing something
 # else and never answered, and the next nudge is hours out. 0 turns it off.
 FOLLOWUP_MIN = int(os.getenv("WATER_FOLLOWUP_MIN", "60"))
+# How late that follow-up may be and still be worth sending. It is allowed to
+# land after SLEEP_HOUR, because finishing an exchange the nudge started is not
+# the same as starting one — but only just after. A Mac asleep at the moment
+# one came due must not wake up and chase last night's nudge over breakfast.
+FOLLOWUP_GRACE_MIN = int(os.getenv("WATER_FOLLOWUP_GRACE_MIN", "30"))
 STATE_PATH = Path(os.getenv("WATER_STATE_FILE", "water_tracker_state.json"))
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
@@ -1177,11 +1182,19 @@ class WaterTracker:
 		return (time.time() - float(waiting_since)) / 60
 
 	def follow_up_due(self) -> bool:
-		"""Whether an unanswered nudge has earned its one follow-up."""
+		"""Whether an unanswered nudge has earned its one follow-up.
+
+		Bounded at both ends. Too early is nagging. Too late is noise: the Mac
+		can sleep straight through the moment a chase came due, and one that
+		surfaces at breakfast about last night's nudge is asking after a
+		question nobody remembers — the morning nudge covers that instead.
+		"""
 		if not FOLLOWUP_MIN or self.state["followed_up"]:
 			return False
 		waiting = self.waiting_minutes()
-		return waiting is not None and waiting >= FOLLOWUP_MIN
+		if waiting is None:
+			return False
+		return FOLLOWUP_MIN <= waiting < FOLLOWUP_MIN + FOLLOWUP_GRACE_MIN
 
 	def maybe_follow_up(self) -> None:
 		"""Chase a nudge nobody answered, once, then stay quiet.
@@ -1207,17 +1220,26 @@ class WaterTracker:
 		)
 
 	def maybe_remind(self) -> None:
-		if not self.awake():
-			return
 		if self.state["paused_on"] == self.today():
 			return
 		if self.total() >= self.goal:
 			return
+		# A nudge goes out only inside the waking window, and only once the
+		# paced gap has passed. A chase is judged separately and deliberately
+		# outlives that window: it finishes an exchange a nudge already started,
+		# and a question asked at 21:50 is still owed its answer at 22:50.
+		# Nothing ever *starts* after SLEEP_HOUR — this is why awake() gates the
+		# nudge here rather than the whole method, which used to mean a nudge in
+		# the last hour of the day could never be chased at all.
+		#
 		# Wall clock, not time.monotonic(): monotonic stops while the Mac is
 		# asleep, so a laptop that naps through the afternoon would wake up
 		# thinking no time had passed and never nudge. Kept in state so a
 		# restart neither loses the spacing nor fires a duplicate.
-		if time.time() - float(self.state["last_nudge_at"]) < self.nudge_gap():
+		nudge_due = self.awake() and (
+			time.time() - float(self.state["last_nudge_at"]) >= self.nudge_gap()
+		)
+		if not nudge_due:
 			# Too early for the next nudge, which is exactly when chasing the
 			# last one is worth it: that gap is hours and the follow-up is an
 			# hour, so this fires in between rather than on top of a nudge.
@@ -1550,8 +1572,18 @@ def doctor() -> None:
 		print(f"        nothing awaiting a reply; follow-up after {FOLLOWUP_MIN} min of silence")
 	else:
 		held = (time.time() - float(waiting)) / 60
-		spent = " (already sent)" if state.get("followed_up") else ""
-		print(f"        nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{spent}")
+		if state.get("followed_up"):
+			why = " (already sent)"
+		elif held >= FOLLOWUP_MIN + FOLLOWUP_GRACE_MIN:
+			# The case that looks like a missing text but is not: nothing was
+			# running when it came due, and a chase this old is deliberately
+			# dropped rather than sent late.
+			why = f" (missed its moment by more than {FOLLOWUP_GRACE_MIN} min, dropped)"
+		elif held >= FOLLOWUP_MIN:
+			why = " (due now)"
+		else:
+			why = f" (in {FOLLOWUP_MIN - held:.0f} min)"
+		print(f"        nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{why}")
 	print(f"        today {total:g}/{goal:g} oz")
 	print("Send a text with 'test' to confirm the Messages Automation prompt was approved.")
 
