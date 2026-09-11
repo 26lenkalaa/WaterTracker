@@ -357,6 +357,39 @@ class TrackerTestCase(unittest.TestCase):
 		self.tracker.state["days"][day.isoformat()] = [{"at": f"{day}T09:00:00", "oz": ounces, "via": "test"}]
 
 
+class DoctorTest(TrackerTestCase):
+	"""doctor describes the agent, not the shell it happens to run in."""
+
+	def stub_check(self, working, how):
+		self.patch(wt, "llm_check", lambda: (working, how))
+
+	def test_the_agents_llm_setting_beats_the_shells(self):
+		# WATER_LLM=off lives in the plist, so doctor run from a terminal
+		# without it exported must not report a failure the agent is not
+		# having. Same mistake as reporting a nudge window the loop is not
+		# using -- doctor describes the agent, not itself.
+		self.stub_check(False, "pattern matching: no credentials, set ANTHROPIC_API_KEY")
+		self.patch(wt, "LLM_MODE", "auto")
+		self.patch(wt, "installed_agent", lambda: {"EnvironmentVariables": {"WATER_LLM": "off"}})
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.doctor()
+		output = printed.getvalue()
+		self.assertIn("WATER_LLM=off in the LaunchAgent", output)
+		self.assertNotIn("FAIL  replies", output, "reported the shell's failure as the agent's")
+
+	def test_a_real_credential_problem_is_still_reported(self):
+		# The other side of it: with no WATER_LLM=off anywhere, a bad key has
+		# to keep showing up as a failure.
+		self.stub_check(False, "pattern matching: credentials rejected, set ANTHROPIC_API_KEY")
+		self.patch(wt, "LLM_MODE", "auto")
+		self.patch(wt, "installed_agent", lambda: {"EnvironmentVariables": {}})
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.doctor()
+		self.assertIn("credentials rejected", printed.getvalue())
+
+
 class StateTest(TrackerTestCase):
 	def test_write_is_atomic_and_leaves_no_scratch_file(self):
 		self.tracker.add(16, "cli")

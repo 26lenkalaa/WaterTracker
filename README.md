@@ -356,7 +356,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 162 tests, ~0.09s
+python3 -m unittest discover .        # 164 tests, ~0.09s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a

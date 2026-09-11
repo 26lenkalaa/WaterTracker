@@ -1810,9 +1810,18 @@ def doctor() -> None:
 	if agent_phone and os.getenv("WATER_PHONE") and agent_phone != os.getenv("WATER_PHONE"):
 		check(False, f"the LaunchAgent texts {agent_phone}, not the {os.getenv('WATER_PHONE')} set here")
 
-	working, how = llm_check()
-	check(working, f"replies {how}")
-	if LLM_MODE != "off" and anthropic is None:
+	# The agent's own setting decides this, not the shell doctor happens to run
+	# in. WATER_LLM=off lives in the plist, so a terminal without it exported
+	# would report a failure the agent is not having — the same mistake as
+	# reporting a nudge window the loop is not using.
+	agent_mode = (agent.get("WATER_LLM") or "").lower()
+	if agent_mode == "off" and LLM_MODE != "off":
+		check(True, "replies pattern matching only (WATER_LLM=off in the LaunchAgent)")
+		working = True
+	else:
+		working, how = llm_check()
+		check(working, f"replies {how}")
+	if agent_mode != "off" and LLM_MODE != "off" and anthropic is None:
 		print("        python3 -m pip install anthropic to have Claude read them")
 	print(f"        state file {STATE_PATH.resolve()}")
 	state = load_state(quarantine=False)
