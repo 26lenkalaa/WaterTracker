@@ -1100,6 +1100,108 @@ class PruneTest(TrackerTestCase):
 		self.assertEqual(self.tracker.total(), 20)
 
 
+class WakeTest(TrackerTestCase):
+	"""Texting 'awake' starts the day, and paces it from then."""
+
+	def iso(self, hour, minute=0, day_offset=0):
+		when = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+		return (when + timedelta(days=day_offset)).isoformat(timespec="seconds")
+
+	def test_wake_words_are_recognised(self):
+		for text in ("awake", "good morning", "morning", "i'm up", "im up",
+		             "just woke up", "woke up", "gm"):
+			with self.subTest(text=text):
+				self.assertEqual(wt.detect_intent(text), "wake")
+
+	def test_mentioning_the_morning_while_logging_is_not_a_wake_signal(self):
+		# The whole reason the pattern sits below the amount check.
+		self.tracker.handle_reply("had a glass this morning")
+		self.assertEqual(self.tracker.total(), 8, "logged nothing; read as a wake signal")
+		self.assertIsNone(self.tracker.state["woke_at"])
+
+	def test_texting_awake_records_the_time_and_answers(self):
+		self.tracker.handle_reply("awake")
+		self.assertIsNotNone(self.tracker.state["woke_at"])
+		self.assertIn("Morning", self.sent[-1])
+
+	def test_waking_up_ends_a_pause(self):
+		# Yesterday's 'going to bed' must not keep today quiet.
+		self.tracker.state["paused_on"] = self.tracker.today()
+		self.tracker.handle_reply("awake")
+		self.assertIsNone(self.tracker.state["paused_on"])
+
+	def test_waking_up_does_not_nudge_in_the_same_breath(self):
+		self.patch(wt, "WAKE_HOUR", 0)
+		self.patch(wt, "SLEEP_HOUR", 24)
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.handle_reply("awake")
+		before = len(self.sent)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.sent), before, "nudged immediately after saying good morning")
+
+	def test_the_day_starts_when_told_not_at_wake_hour(self):
+		self.patch(wt, "WAKE_HOUR", 8)
+		self.patch(wt, "SLEEP_HOUR", 22)
+		cases = {None: 8.0, self.iso(6, 30): 6.5, self.iso(10, 45): 10.75}
+		for woke, expected in cases.items():
+			with self.subTest(woke=woke):
+				self.tracker.state["woke_at"] = woke
+				self.assertAlmostEqual(self.tracker.day_start(), expected, places=2)
+
+	def test_an_early_riser_is_taken_at_their_word(self):
+		# Clamping this up to WAKE_HOUR would make waking early feel identical
+		# to not texting at all, which is the thing the feature exists to fix.
+		self.patch(wt, "WAKE_HOUR", 8)
+		self.tracker.state["woke_at"] = self.iso(6, 0)
+		self.assertEqual(self.tracker.day_start(), 6.0)
+
+	def test_a_late_nap_cannot_invert_the_day(self):
+		self.patch(wt, "WAKE_HOUR", 8)
+		self.patch(wt, "SLEEP_HOUR", 22)
+		self.tracker.state["woke_at"] = self.iso(23, 30)
+		self.assertEqual(self.tracker.day_start(), 22.0, "day_start overtook SLEEP_HOUR")
+
+	def test_yesterdays_wake_time_is_ignored(self):
+		self.patch(wt, "WAKE_HOUR", 8)
+		self.tracker.state["woke_at"] = self.iso(6, 30, day_offset=-1)
+		self.assertEqual(self.tracker.day_start(), 8.0, "paced off a stale wake time")
+
+	def test_an_unreadable_wake_time_falls_back(self):
+		self.patch(wt, "WAKE_HOUR", 8)
+		for junk in ("not-a-date", "", 12345, None):
+			with self.subTest(junk=junk):
+				self.tracker.state["woke_at"] = junk
+				self.assertEqual(self.tracker.day_start(), 8.0)
+
+	def test_waking_late_lowers_the_pace_target(self):
+		self.patch(wt, "WAKE_HOUR", 8)
+		self.patch(wt, "SLEEP_HOUR", 22)
+		noon = datetime.now().replace(hour=12, minute=0)
+		self.tracker.state["woke_at"] = None
+		default = self.tracker.expected_by_now(noon)
+		self.tracker.state["woke_at"] = self.iso(10, 45)
+		late = self.tracker.expected_by_now(noon)
+		self.assertLess(late, default, "a late start still expected a full day's water")
+
+	def test_the_window_opens_early_when_told(self):
+		# awake() has to follow day_start too, or the pace moves but the
+		# nudges still wait for WAKE_HOUR.
+		hour = datetime.now().hour
+		self.patch(wt, "WAKE_HOUR", (hour + 1) % 24)
+		self.patch(wt, "SLEEP_HOUR", 23 if hour < 23 else 24)
+		self.tracker.state["woke_at"] = None
+		if not self.tracker.awake():
+			self.tracker.state["woke_at"] = datetime.now().isoformat(timespec="seconds")
+			self.assertTrue(self.tracker.awake(), "still shut out after saying I was up")
+
+	def test_claude_can_report_a_wake_too(self):
+		self.assertIn("wake", wt.PLAN_ACTIONS)
+		plan = wt.sane_plan({"action": "wake", "ounces": None, "goal_oz": None, "chat": None})
+		self.assertEqual(plan["action"], "wake")
+		self.tracker.follow_plan(plan)
+		self.assertIsNotNone(self.tracker.state["woke_at"])
+
+
 class RemindTest(TrackerTestCase):
 	def setUp(self):
 		super().setUp()

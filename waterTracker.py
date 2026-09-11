@@ -309,6 +309,13 @@ INTENT_PATTERNS = (
 		r"\b(not yet|later|in a (bit|min|minute|sec|while)|hold on|soon|nope|no thanks"
 		r"|didn'?t|haven'?t|hasn'?t|forgot)\b|^(no|nah)$"
 	)),
+	# Deliberately below every command above, and checked below the amount in
+	# handle_reply: "had a glass this morning" is a log that happens to mention
+	# the morning, not an announcement of waking up.
+	("wake", re.compile(
+		r"\b(awake|i'?m up|im up|just woke|woke up|good morning|gm)\b"
+		r"|^(morning|awake|up)$"
+	)),
 	# No amount given, just confirmation that some water happened.
 	("drank", re.compile(
 		r"\b(done|did it|drank|drinking|drunk|finished|chugged|gulped|sipped|refill(ed)?"
@@ -445,7 +452,7 @@ def digits(handle: str) -> str:
 	return re.sub(r"\D", "", handle)[-10:]
 
 
-PLAN_ACTIONS = ("log", "status", "week", "goal", "undo", "pause", "resume", "later", "chat")
+PLAN_ACTIONS = ("log", "status", "week", "goal", "undo", "pause", "resume", "later", "wake", "chat")
 
 PLAN_SCHEMA = {
 	"type": "object",
@@ -486,6 +493,7 @@ Any drink counts, not only water.
 - undo: they want the last entry removed, including "oops" and "that was wrong".
 - pause: they want reminders to stop for the day, including "going to bed".
 - resume: they want reminders to start again.
+- wake: they are telling you they just got up — "awake", "good morning", "just woke up". Today's pacing starts from now. Not for a message that merely mentions the morning while reporting a drink.
 - later: they have not drunk anything yet and want to be asked again soon. Use \
 this for "not yet", "in a bit", and for anything they say they did NOT drink.
 - chat: none of the above. Put a friendly reply of at most two sentences in \
@@ -671,6 +679,12 @@ def _disable_llm() -> None:
 	print("   falling back to pattern matching for the rest of this run")
 
 
+def clock(hour: float) -> str:
+	"""An hour-as-float rendered as a time: 7.5 becomes '7:30'."""
+	whole = int(hour)
+	return f"{whole}:{round((hour - whole) * 60):02d}"
+
+
 def message_time(raw: int | None) -> float | None:
 	"""Unix seconds for a Messages timestamp, None when there is none."""
 	if not raw:
@@ -733,6 +747,10 @@ class WaterTracker:
 		# unanswered nudge nor follows up on one twice.
 		self.state.setdefault("awaiting_reply_since", None)
 		self.state.setdefault("followed_up", False)
+		# When today actually began, ISO, or None to fall back to WAKE_HOUR.
+		# Set by texting 'awake' — a Shortcuts automation on the Wake Up
+		# trigger can do that without anyone touching the phone.
+		self.state.setdefault("woke_at", None)
 		# Echoes were a bare list of message strings before they carried a
 		# timestamp. Anything written in the old shape is long stale.
 		if not all(isinstance(echo, list) and len(echo) == 2 for echo in self.state["sent_echoes"]):
@@ -1005,6 +1023,27 @@ class WaterTracker:
 		self.save()
 		return "Reminders back on."
 
+	def wake(self) -> str:
+		"""Start the day now rather than at WAKE_HOUR.
+
+		Waking up also ends a pause: yesterday's 'going to bed' should not keep
+		today quiet. The nudge clock is reset too, so the acknowledgement below
+		counts as the morning's first contact and the next nudge is a full gap
+		away — being texted twice in the first minute of being awake is not a
+		good introduction to a hydration tracker.
+		"""
+		now = datetime.now()
+		self.state["woke_at"] = now.isoformat(timespec="seconds")
+		self.state["paused_on"] = None
+		self.state["last_nudge_at"] = time.time()
+		self.state["awaiting_reply_since"] = None
+		self.save()
+		left = SLEEP_HOUR - self.day_start()
+		return (
+			f"Morning. Goal {self.goal:g} oz by {SLEEP_HOUR}:00 — "
+			f"{left:.0f}h to drink it. {self.progress_line()}"
+		)
+
 	def snooze(self) -> str:
 		"""Push the next nudge out a full gap without pausing the whole day."""
 		self.state["last_nudge_at"] = time.time()
@@ -1064,6 +1103,8 @@ class WaterTracker:
 			self.send(self.pause())
 		elif action == "resume":
 			self.send(f"{self.resume()} {self.progress_line()}")
+		elif action == "wake":
+			self.send(self.wake())
 		elif action == "later":
 			self.send(self.snooze())
 		else:
@@ -1136,6 +1177,9 @@ class WaterTracker:
 		if intent == "later":
 			self.send(self.snooze())
 			return
+		if intent == "wake":
+			self.send(self.wake())
+			return
 		if intent == "drank":
 			# No amount, just confirmation. A glass is the safest guess, and
 			# saying so invites a correction rather than hiding it.
@@ -1150,15 +1194,43 @@ class WaterTracker:
 	# ----- reminders -----
 
 	def awake(self) -> bool:
-		return WAKE_HOUR <= datetime.now().hour < SLEEP_HOUR
+		now = datetime.now()
+		return self.day_start() <= now.hour + now.minute / 60 < SLEEP_HOUR
+
+	def day_start(self) -> float:
+		"""The hour the day began, as a float: 7.5 means 07:30.
+
+		WATER_WAKE_HOUR is only a fallback. Texting 'awake' records the real
+		time, which matters more than it sounds: a fixed 8:00 means waking at
+		06:00 leaves two hours where you are ahead of pace by definition, and
+		waking at 10:00 starts you already behind on water you were asleep for.
+
+		Only today's record counts. Yesterday's wake time says nothing about
+		this morning, and a stale one would skew the pace all day.
+		"""
+		woke = self.state.get("woke_at")
+		if woke:
+			try:
+				at = datetime.fromisoformat(woke)
+			except (TypeError, ValueError):
+				return float(WAKE_HOUR)
+			if at.date() == date.today():
+				# Taken as given, even before WAKE_HOUR: saying you are up is
+				# explicit, and clamping it up to 8:00 would make an early
+				# riser wait exactly as long as before, which is the thing this
+				# exists to fix. Only the top is clamped, so a late nap cannot
+				# leave SLEEP_HOUR behind it and invert the day.
+				return min(at.hour + at.minute / 60, float(SLEEP_HOUR))
+		return float(WAKE_HOUR)
 
 	def expected_by_now(self, now: datetime | None = None) -> float:
 		"""Ounces you would have drunk at an even pace across the waking day."""
-		hours = SLEEP_HOUR - WAKE_HOUR
+		start = self.day_start()
+		hours = SLEEP_HOUR - start
 		if hours <= 0:
 			return self.goal
 		now = now or datetime.now()
-		elapsed = now.hour + now.minute / 60 - WAKE_HOUR
+		elapsed = now.hour + now.minute / 60 - start
 		return self.goal * min(1.0, max(0.0, elapsed / hours))
 
 	def nudge_gap(self, now: datetime | None = None) -> float:
@@ -1535,9 +1607,24 @@ def doctor() -> None:
 	total = sum(entry["oz"] for entry in state.get("days", {}).get(today, []))
 	paused = state.get("paused_on") == today
 	check(not paused, "paused for today, reply 'resume'" if paused else "not paused")
-	awake = WAKE_HOUR <= datetime.now().hour < SLEEP_HOUR
+	# Read the same way the loop reads it, or doctor reports a window the
+	# tracker is not actually using once 'awake' has been texted.
+	start = float(WAKE_HOUR)
+	woke = state.get("woke_at")
+	if woke:
+		try:
+			at = datetime.fromisoformat(woke)
+			if at.date() == date.today():
+				start = min(max(at.hour + at.minute / 60, float(WAKE_HOUR)), float(SLEEP_HOUR))
+				print(f"        day started {at:%H:%M} (you texted that you were up)")
+		except (TypeError, ValueError):
+			print(f"        woke_at is unreadable ({woke!r}); falling back to {WAKE_HOUR}:00")
+	else:
+		print(f"        no wake time texted today; pacing from {WAKE_HOUR}:00")
+	right_now = datetime.now()
+	awake = start <= right_now.hour + right_now.minute / 60 < SLEEP_HOUR
 	if awake:
-		check(True, f"inside the {WAKE_HOUR}:00-{SLEEP_HOUR}:00 nudge window")
+		check(True, f"inside the {clock(start)}-{SLEEP_HOUR}:00 nudge window")
 	else:
 		# The time of day is not a fault, so it reads as a fact, not a failure.
 		print(f"        outside the {WAKE_HOUR}:00-{SLEEP_HOUR}:00 nudge window")

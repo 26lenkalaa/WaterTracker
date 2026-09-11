@@ -105,6 +105,7 @@ the phrasings below.
 | `my nalgene` / `a can` / `a pint` | logs the container's size |
 | `twenty five ounces` / `3/4 of a bottle` | logs 25 oz / 12.7 oz |
 | `done` / `yep` / `just finished one` / 👍 | logs one glass, and says it guessed |
+| `awake` / `good morning` / `gm` | starts the day now, and paces from this moment |
 | `not yet` / `in a bit` | pushes the next nudge out, without pausing |
 | `status` / `?` / `how am i doing` | today's progress |
 | `week` / `my weekly average` | last 7 days |
@@ -152,6 +153,34 @@ All optional except the phone number.
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
 A fixed interval nudges the same whether you're 5 oz or 50 oz short.
+
+### Starting the day when you actually wake up
+
+`WATER_WAKE_HOUR` is only a fallback. Text `awake` (or `good morning`) and the
+tracker records the time, paces the day from then, and ends any pause left over
+from last night. Waking at 06:30 stops being two hours where you're ahead of
+pace by definition; waking at 10:45 stops starting you 14 oz behind on water
+you were asleep for.
+
+The point is that this can be automatic. On iOS, **Shortcuts → Automation →
+Personal → Wake Up** fires at the wake time from your Sleep Schedule, and the
+action is just *Send Message* — `awake`, to the same number the tracker texts.
+Set it to **Run Immediately** with *Ask Before Running* off and nothing needs
+touching. No new plumbing on this end: the loop already reads incoming texts
+every few seconds, so a wake signal arrives the same way an amount does.
+
+Since the Shortcut runs on your phone, it can read Health there and send real
+numbers with it — `awake, slept 7h20m`. Apple Watch data can't be read on this
+end at all: `HealthKit.framework` does ship on macOS, but
+`HKHealthStore.isHealthDataAvailable()` returns `NO` (it's there for Mac
+Catalyst builds) and Health never syncs to a Mac. The phone is the only place
+that data exists, so the phone is what has to send it.
+
+Two bounds worth knowing. A wake time from a previous day is ignored rather
+than paced from, and one later than `WATER_SLEEP_HOUR` is clamped to it, so a
+late nap can't invert the day. An early wake is taken at its word and *not*
+clamped up to `WATER_WAKE_HOUR` — clamping would make waking early feel
+identical to not texting at all, which is the thing this exists to fix.
 
 A nudge you never answer gets **one follow-up** an hour later, worded as a
 follow-up rather than a fresh nudge:
@@ -282,7 +311,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 118 tests, ~0.06s
+python3 -m unittest discover .        # 134 tests, ~0.07s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
