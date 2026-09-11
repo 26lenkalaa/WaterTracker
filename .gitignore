@@ -6,4 +6,9 @@ water_tracker_state.json.corrupt
 __pycache__/
 *.pyc
 
+# Tool caches. Both write their own .gitignore inside themselves, so the
+# contents were already ignored; these entries cover the directories too.
+.mypy_cache/
+.pytest_cache/
+
 .DS_Store
