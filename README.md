@@ -432,8 +432,8 @@ section is here so nobody has to guess at that.
 
 | | |
 |---|---|
-| **AI wrote** | all of `waterTracker.py` and `test_waterTracker.py`, part of the README, and co-authored commits|
-| **I did** | the idea and requirements, , the design decisions, testing on real hardware, and the bug reports that drove most of the fixes, part of the README, and co-authored commits|
+| **AI wrote** | all of `waterTracker.py` and `test_waterTracker.py`, part of the README, and co-authored commits |
+| **I did** | the idea and requirements, the design decisions, testing on real hardware, and the bug reports that drove most of the fixes, part of the README, and co-authored commits |
 
 Commits are marked with a `Co-Authored-By: Claude` trailer, so the record is in
 `git log` as well as here.
