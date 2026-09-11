@@ -401,6 +401,40 @@ class PushTest(TrackerTestCase):
 				self.tracker.handle_reply(reply)
 				self.assertEqual(self.pushed, [], f"{reply!r} pushed a confirmation")
 
+	def test_push_only_keeps_the_tracker_out_of_messages(self):
+		# The self-chat shows every message twice, so the fix is to not put
+		# them there at all. Nothing should reach osascript.
+		self.patch(wt, "PUSH_ONLY", True)
+		texted = []
+		self.patch(subprocess, "run",
+		           lambda *a, **k: texted.append(a) or SimpleNamespace(returncode=0, stderr="", stdout=""))
+		wt.WaterTracker.send(self.tracker, "💧 Water break.", push=True)
+		wt.WaterTracker.send(self.tracker, "💧 Logged 32 oz.", push=False)
+		self.assertEqual(self.calls, ["💧 Water break.", "💧 Logged 32 oz."],
+		                 "push-only did not push everything")
+		self.assertEqual(texted, [], "push-only still sent a text")
+
+	def test_push_only_still_texts_when_the_push_fails(self):
+		# Dropping the text after a failed push would lose the message
+		# outright, which is worse than the duplicate it avoids.
+		self.patch(wt, "PUSH_ONLY", True)
+		self.push_ok = False
+		texted = []
+		self.patch(subprocess, "run",
+		           lambda *a, **k: texted.append(a) or SimpleNamespace(returncode=0, stderr="", stdout=""))
+		wt.WaterTracker.send(self.tracker, "💧 Water break.", push=True)
+		self.assertEqual(len(texted), 1, "a failed push lost the message entirely")
+
+	def test_push_only_records_no_echo(self):
+		# Nothing entered Messages, so there is nothing coming back that
+		# read_replies could mistake for a reply.
+		self.patch(wt, "PUSH_ONLY", True)
+		self.patch(subprocess, "run",
+		           lambda *a, **k: SimpleNamespace(returncode=0, stderr="", stdout=""))
+		before = len(self.tracker.state["sent_echoes"])
+		wt.WaterTracker.send(self.tracker, "💧 Water break.", push=True)
+		self.assertEqual(len(self.tracker.state["sent_echoes"]), before)
+
 	def test_the_real_send_only_pushes_when_asked(self):
 		# The test above asserts on the stub, so it cannot see the guard inside
 		# send() itself. This one drives the real method both ways.

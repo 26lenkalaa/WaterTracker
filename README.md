@@ -154,6 +154,7 @@ All optional except the phone number.
 | `WATER_PHOTO_MAX_PX` | 1024 | longest edge a photo is downscaled to |
 | `WATER_PUSH_URL` | — | push nudges here as well as texting them |
 | `WATER_PUSH_TIMEOUT` | 10 | seconds before a push gives up |
+| `WATER_PUSH_ONLY` | — | `on` to push instead of texting, not as well |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
@@ -286,8 +287,18 @@ app, subscribe to the same topic, and the notification comes from a real app
 instead of from yourself. **Pick a long random topic**: a public ntfy topic is
 readable by anyone who knows its name, and this one carries your intake.
 
-Only the messages meant to interrupt you get a push — the paced nudge and the
-follow-up chase. A confirmation of something you just typed does not buzz your
+A self-chat shows **every message twice** — once as sent, once as the same
+thing received — so the tracker's half of the conversation doubles everything in
+the thread. `WATER_PUSH_ONLY=on` keeps it out of Messages altogether, leaving
+only what you actually typed. The text is still the fallback when a push
+fails, because losing the reminder outright is worse than a duplicate.
+
+Your own messages still double even then: that is iMessage's own behaviour for
+a self-chat and nothing here can change it. The only complete cure is not
+texting your own number.
+
+Without `WATER_PUSH_ONLY`, only the messages meant to interrupt you get a push
+— the paced nudge and the follow-up chase. A confirmation of something you just typed does not buzz your
 phone. The push fires *before* the text and regardless of how the text goes, so
 an `osascript` timeout cannot take the notification down with it, and a push
 that fails is a missed notification and nothing worse: the text is still the
@@ -391,7 +402,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 176 tests, ~0.10s
+python3 -m unittest discover .        # 179 tests, ~0.10s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a

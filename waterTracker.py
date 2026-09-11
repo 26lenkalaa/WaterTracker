@@ -368,6 +368,12 @@ PHOTO_TYPES = ("image/heic", "image/heif", "image/png", "image/jpeg", "image/web
 # unguessable one, because a public topic is readable by anyone who knows it.
 PUSH_URL = os.getenv("WATER_PUSH_URL", "").strip()
 PUSH_TIMEOUT = int(os.getenv("WATER_PUSH_TIMEOUT", "10"))
+# With a push channel set up, the text version of a nudge is redundant — two
+# alerts for one reminder, and it fills the Messages thread with the tracker's
+# half of a conversation you never wanted to have. This drops the text for the
+# messages that push, and leaves the replies alone: answering you is still done
+# by text, because that is the only channel that goes both ways.
+PUSH_ONLY = os.getenv("WATER_PUSH_ONLY", "").strip().lower() in ("1", "on", "yes")
 
 
 def fast_path_ounces(text: str) -> float | None:
@@ -1091,13 +1097,24 @@ class WaterTracker:
 		if not message.startswith(MARKER):
 			message = f"{MARKER} {message}"
 		print(f"-> {message}")
-		# Fired before the text, and regardless of how the text goes. The push
-		# is the half that reliably notifies, so an osascript timeout — which
-		# returns early below — must not take it down too. Only the messages
-		# meant to interrupt you get one; a confirmation of something you just
+		# A self-chat shows every message twice — once as sent, once as the
+		# same thing received — so the tracker's half of the conversation
+		# doubles everything in the thread. WATER_PUSH_ONLY keeps it out of
+		# Messages altogether, leaving only what you actually typed.
+		#
+		# Otherwise the push goes out alongside the text, before it and
+		# regardless of how it goes: an osascript timeout returns early below
+		# and must not take the notification with it. Only messages meant to
+		# interrupt you get one, since a confirmation of something you just
 		# typed does not need to buzz your phone.
-		if push and PUSH_URL:
-			push_notification(message)
+		#
+		# The text stays the fallback either way: skipping it after a *failed*
+		# push would lose the message outright, which is worse than a
+		# duplicate. Nothing is recorded in sent_echoes on the push-only path,
+		# because nothing entered Messages for read_replies to misread.
+		if PUSH_URL and (push or PUSH_ONLY):
+			if push_notification(message) and PUSH_ONLY:
+				return
 		try:
 			result = subprocess.run(
 				["osascript", "-", self.phone, message],
@@ -1764,6 +1781,7 @@ def install_agent() -> None:
 		"WATER_PHOTO_MAX_PX",
 		"WATER_PUSH_URL",
 		"WATER_PUSH_TIMEOUT",
+		"WATER_PUSH_ONLY",
 		# launchd jobs inherit nothing from your shell, so the key has to be
 		# written into the plist or the agent quietly loses interpretation.
 		"ANTHROPIC_API_KEY",
