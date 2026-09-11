@@ -345,7 +345,14 @@ class TrackerTestCase(unittest.TestCase):
 		self.patch(wt, "llm_plan", lambda text: None)
 		self.tracker = wt.WaterTracker()
 		self.sent = []
-		self.tracker.send = self.sent.append
+		self.pushed = []
+		self.tracker.send = self.capture_send
+
+	def capture_send(self, message, push=False):
+		"""Stand in for send(), noting which messages asked for a push."""
+		self.sent.append(message)
+		if push:
+			self.pushed.append(message)
 
 	def patch(self, module, name, value):
 		"""Swap a module-level setting for the duration of one test."""
@@ -355,6 +362,131 @@ class TrackerTestCase(unittest.TestCase):
 
 	def set_day(self, day, ounces):
 		self.tracker.state["days"][day.isoformat()] = [{"at": f"{day}T09:00:00", "oz": ounces, "via": "test"}]
+
+
+class PushTest(TrackerTestCase):
+	"""The push channel: which messages get one, and failing softly."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "PUSH_URL", "https://ntfy.example/topic")
+		self.calls = []
+		self.patch(wt, "push_notification", self.fake_push)
+		self.push_ok = True
+
+	def fake_push(self, text, title="Water tracker"):
+		self.calls.append(text)
+		return self.push_ok
+
+	def test_a_nudge_pushes(self):
+		self.patch(wt, "WAKE_HOUR", 0)
+		self.patch(wt, "SLEEP_HOUR", 24)
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.pushed), 1, "a nudge went out without a push")
+
+	def test_a_chase_pushes(self):
+		self.patch(wt, "WAKE_HOUR", 0)
+		self.patch(wt, "SLEEP_HOUR", 24)
+		self.tracker.maybe_remind()
+		self.tracker.state["awaiting_reply_since"] = time.time() - wt.FOLLOWUP_MIN * 60
+		self.pushed.clear()
+		self.tracker.maybe_remind()
+		self.assertEqual(len(self.pushed), 1, "an unanswered nudge was chased without a push")
+
+	def test_a_confirmation_does_not_push(self):
+		# You just typed it; your phone does not need to buzz about it.
+		for reply in ("32 oz", "status", "week", "not yet", "awake", "oops"):
+			with self.subTest(reply=reply):
+				self.pushed.clear()
+				self.tracker.handle_reply(reply)
+				self.assertEqual(self.pushed, [], f"{reply!r} pushed a confirmation")
+
+	def test_the_real_send_only_pushes_when_asked(self):
+		# The test above asserts on the stub, so it cannot see the guard inside
+		# send() itself. This one drives the real method both ways.
+		self.patch(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr="", stdout=""))
+		wt.WaterTracker.send(self.tracker, "💧 Logged 32 oz.", push=False)
+		self.assertEqual(self.calls, [], "a confirmation pushed anyway")
+		wt.WaterTracker.send(self.tracker, "💧 Water break.", push=True)
+		self.assertEqual(self.calls, ["💧 Water break."])
+
+	def test_the_push_goes_out_before_the_text_can_fail(self):
+		# The push is the half that reliably notifies, so an osascript timeout
+		# must not take it down as well.
+		self.patch(wt, "PUSH_URL", "https://ntfy.example/topic")
+		def explode(*args, **kwargs):
+			raise subprocess.TimeoutExpired(cmd="osascript", timeout=1)
+		self.patch(subprocess, "run", explode)
+		wt.WaterTracker.send(self.tracker, "💧 nudge", push=True)
+		self.assertEqual(self.calls, ["💧 nudge"], "a failed text lost the push")
+
+	def test_no_url_means_no_push_attempt(self):
+		self.patch(wt, "PUSH_URL", "")
+		self.patch(wt, "WAKE_HOUR", 0)
+		self.patch(wt, "SLEEP_HOUR", 24)
+		self.tracker.maybe_remind()
+		self.assertEqual(self.calls, [], "tried to push with no URL configured")
+
+
+class PushNotificationTest(unittest.TestCase):
+	"""push_notification itself, against a stand-in curl."""
+
+	def setUp(self):
+		self.previous = wt.PUSH_URL
+		wt.PUSH_URL = "https://ntfy.example/topic"
+		self.addCleanup(setattr, wt, "PUSH_URL", self.previous)
+
+	def fake_curl(self, returncode=0, stderr="", raises=None):
+		calls = []
+
+		def run(command, **kwargs):
+			calls.append((command, kwargs))
+			if raises:
+				raise raises
+			return SimpleNamespace(returncode=returncode, stderr=stderr, stdout="")
+
+		previous = subprocess.run
+		subprocess.run = run
+		self.addCleanup(setattr, subprocess, "run", previous)
+		return calls
+
+	def test_posts_the_body_to_the_configured_url(self):
+		calls = self.fake_curl()
+		self.assertTrue(wt.push_notification("drink water"))
+		command, kwargs = calls[0]
+		self.assertEqual(command[0], "curl")
+		self.assertEqual(command[-1], "https://ntfy.example/topic")
+		self.assertEqual(kwargs["input"], "drink water")
+		self.assertIn("--max-time", command)
+
+	def test_an_empty_url_is_a_no_op(self):
+		calls = self.fake_curl()
+		wt.PUSH_URL = ""
+		self.assertFalse(wt.push_notification("drink water"))
+		self.assertEqual(calls, [], "shelled out with nothing configured")
+
+	def test_a_curl_failure_is_reported_not_raised(self):
+		self.fake_curl(returncode=6, stderr="curl: (6) Could not resolve host")
+		with redirect_stdout(io.StringIO()):
+			self.assertFalse(wt.push_notification("drink water"))
+
+	def test_a_timeout_is_reported_not_raised(self):
+		self.fake_curl(raises=subprocess.TimeoutExpired(cmd="curl", timeout=10))
+		with redirect_stdout(io.StringIO()):
+			self.assertFalse(wt.push_notification("drink water"))
+
+	def test_curl_missing_entirely_is_not_fatal(self):
+		self.fake_curl(raises=OSError("No such file or directory: 'curl'"))
+		with redirect_stdout(io.StringIO()):
+			self.assertFalse(wt.push_notification("drink water"))
+
+	def test_the_title_header_is_ascii(self):
+		# Headers are not a place for emoji; the body carries those.
+		calls = self.fake_curl()
+		wt.push_notification("💧 Still 32/128 oz")
+		command, _ = calls[0]
+		title = command[command.index("-H") + 1]
+		title.encode("ascii")  # raises if it is not
 
 
 class DoctorTest(TrackerTestCase):
@@ -830,7 +962,7 @@ class MarkerTest(TrackerTestCase):
 
 		self.patch(wt.subprocess, "run", fake_run)
 		# The real send, not the capturing stub the base class installs.
-		self.tracker.send = lambda message: wt.WaterTracker.send(self.tracker, message)
+		self.tracker.send = lambda message, push=False: wt.WaterTracker.send(self.tracker, message, push)
 
 	def test_every_outgoing_message_carries_the_marker(self):
 		self.tracker.handle_reply("16 oz")
@@ -1599,7 +1731,7 @@ class RemindTest(TrackerTestCase):
 	def test_interval_survives_a_restart(self):
 		self.tracker.maybe_remind()
 		restarted = wt.WaterTracker()
-		restarted.send = self.sent.append
+		restarted.send = self.capture_send
 		restarted.maybe_remind()
 		self.assertEqual(len(self.sent), 1, "a restart re-nudged immediately")
 
@@ -1719,14 +1851,14 @@ class FollowUpTest(TrackerTestCase):
 		self.tracker.save()
 
 		restarted = wt.WaterTracker()
-		restarted.send = self.sent.append
+		restarted.send = self.capture_send
 		restarted.maybe_remind()
 		self.assertEqual(len(self.chases()), 1, "a restart forgot the unanswered nudge")
 
 		# And the restart must not re-chase what it already chased.
 		restarted.save()
 		again = wt.WaterTracker()
-		again.send = self.sent.append
+		again.send = self.capture_send
 		again.maybe_remind()
 		self.assertEqual(len(self.chases()), 1, "a restart chased the same nudge twice")
 

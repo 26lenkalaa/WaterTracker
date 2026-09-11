@@ -152,6 +152,8 @@ All optional except the phone number.
 | `WATER_FAST_PATH` | `on` | `off` to send even bare amounts to Claude |
 | `WATER_PHOTOS` | `on` | `off` to ignore photo attachments |
 | `WATER_PHOTO_MAX_PX` | 1024 | longest edge a photo is downscaled to |
+| `WATER_PUSH_URL` | — | push nudges here as well as texting them |
+| `WATER_PUSH_TIMEOUT` | 10 | seconds before a push gives up |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
@@ -263,6 +265,39 @@ Three things worth knowing:
   always answered in words — silence here is indistinguishable from a tracker
   that has stopped working. `WATER_PHOTOS=off` turns it off.
 
+### Getting notified reliably
+
+Texting your own number has one flaw no setting fixes: **every tracker message
+comes from your own Apple ID**, and iOS treats your own traffic differently
+from a real correspondent's. The database shows the shape of it — in the
+tracker's thread there are exactly as many outgoing rows as incoming ones,
+because each message is logged twice, and the copy of anything *you* send comes
+back already marked read.
+
+So set `WATER_PUSH_URL` and the nudges go out as a push as well as a text:
+
+```bash
+export WATER_PUSH_URL="https://ntfy.sh/water-<something-long-and-random>"
+python3 waterTracker.py test     # sends both, so you can see which arrives
+```
+
+[ntfy](https://ntfy.sh) needs no account — any URL path is a topic. Install the
+app, subscribe to the same topic, and the notification comes from a real app
+instead of from yourself. **Pick a long random topic**: a public ntfy topic is
+readable by anyone who knows its name, and this one carries your intake.
+
+Only the messages meant to interrupt you get a push — the paced nudge and the
+follow-up chase. A confirmation of something you just typed does not buzz your
+phone. The push fires *before* the text and regardless of how the text goes, so
+an `osascript` timeout cannot take the notification down with it, and a push
+that fails is a missed notification and nothing worse: the text is still the
+record of what happened.
+
+It shells out to `curl` rather than using `urllib`, for a specific reason: this
+interpreter has no usable CA bundle (`ssl.get_default_verify_paths().cafile` is
+`None`), so `urllib` cannot do HTTPS here at all, while `curl` uses the system
+store. It also keeps the promise that nothing needs installing from pip.
+
 ## How it works
 
 ```
@@ -356,7 +391,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 164 tests, ~0.09s
+python3 -m unittest discover .        # 176 tests, ~0.10s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a

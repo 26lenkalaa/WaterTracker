@@ -358,6 +358,17 @@ PHOTOS = os.getenv("WATER_PHOTOS", "on").strip().lower() not in ("0", "off", "no
 PHOTO_MAX_PX = int(os.getenv("WATER_PHOTO_MAX_PX", "1024"))
 PHOTO_TYPES = ("image/heic", "image/heif", "image/png", "image/jpeg", "image/webp", "image/gif")
 
+# A push channel for the texts that have to interrupt you. Texting your own
+# number is the one thing that cannot notify reliably: every tracker message
+# comes from your own Apple ID, and iOS treats your own traffic differently
+# from a real correspondent's. A push comes from an actual app, so it behaves
+# like any other notification. Empty turns it off and nothing changes.
+#
+# ntfy.sh needs no account — any URL path is a topic, so pick a long
+# unguessable one, because a public topic is readable by anyone who knows it.
+PUSH_URL = os.getenv("WATER_PUSH_URL", "").strip()
+PUSH_TIMEOUT = int(os.getenv("WATER_PUSH_TIMEOUT", "10"))
+
 
 def fast_path_ounces(text: str) -> float | None:
 	"""Ounces from a message that says nothing but the amount, else None.
@@ -865,6 +876,42 @@ def _disable_llm() -> None:
 	print("   falling back to pattern matching for the rest of this run")
 
 
+def push_notification(text: str, title: str = "Water tracker") -> bool:
+	"""Send one push. False on any failure, and it never raises.
+
+	curl rather than urllib. This interpreter has no usable CA bundle —
+	ssl.get_default_verify_paths().cafile is None, so urllib cannot do HTTPS
+	here at all — while curl uses the system store. It is also already the
+	pattern in this file, and keeps the promise of no pip dependencies.
+
+	Best effort by design: the text message is still the record of what
+	happened, so a push that fails is a missed notification and nothing worse.
+	"""
+	if not PUSH_URL:
+		return False
+	try:
+		done = subprocess.run(
+			[
+				"curl", "-sS", "--max-time", str(PUSH_TIMEOUT),
+				# ASCII only in headers; the body carries the interesting text.
+				"-H", f"Title: {title}",
+				"--data-binary", "@-", PUSH_URL,
+			],
+			input=text, capture_output=True, text=True, timeout=PUSH_TIMEOUT + 5,
+		)
+	except subprocess.TimeoutExpired:
+		print(f"   push timed out after {PUSH_TIMEOUT}s")
+		return False
+	except OSError as error:
+		print(f"   push failed: {error}")
+		return False
+	if done.returncode != 0:
+		detail = done.stderr.strip().splitlines()
+		print(f"   push failed: {detail[-1] if detail else f'curl exit {done.returncode}'}")
+		return False
+	return True
+
+
 def clock(hour: float) -> str:
 	"""An hour-as-float rendered as a time: 7.5 becomes '7:30'."""
 	whole = int(hour)
@@ -1039,11 +1086,18 @@ class WaterTracker:
 				"Set your own number, digits included: export WATER_PHONE=\"+15551234567\""
 			)
 
-	def send(self, message: str) -> None:
+	def send(self, message: str, push: bool = False) -> None:
 		self.require_phone()
 		if not message.startswith(MARKER):
 			message = f"{MARKER} {message}"
 		print(f"-> {message}")
+		# Fired before the text, and regardless of how the text goes. The push
+		# is the half that reliably notifies, so an osascript timeout — which
+		# returns early below — must not take it down too. Only the messages
+		# meant to interrupt you get one; a confirmation of something you just
+		# typed does not need to buzz your phone.
+		if push and PUSH_URL:
+			push_notification(message)
 		try:
 			result = subprocess.run(
 				["osascript", "-", self.phone, message],
@@ -1546,7 +1600,8 @@ class WaterTracker:
 		# the command line, without a reply.
 		self.send(
 			f"\U0001f4a7 Still {self.progress_line()} — no reply since I asked "
-			f"{waiting:.0f} min ago.\nReply with an amount to log it, or 'not yet'."
+			f"{waiting:.0f} min ago.\nReply with an amount to log it, or 'not yet'.",
+			push=True,
 		)
 
 	def maybe_remind(self) -> None:
@@ -1589,7 +1644,8 @@ class WaterTracker:
 		deficit = self.expected_by_now() - self.total()
 		behind = f" {deficit:.0f} oz behind pace." if deficit >= 1 else ""
 		self.send(
-			f"\U0001f4a7 {nudge} {self.progress_line()}{behind}\nReply with an amount to log it."
+			f"\U0001f4a7 {nudge} {self.progress_line()}{behind}\nReply with an amount to log it.",
+			push=True,
 		)
 
 	def run(self) -> None:
@@ -1706,6 +1762,8 @@ def install_agent() -> None:
 		"WATER_FAST_PATH",
 		"WATER_PHOTOS",
 		"WATER_PHOTO_MAX_PX",
+		"WATER_PUSH_URL",
+		"WATER_PUSH_TIMEOUT",
 		# launchd jobs inherit nothing from your shell, so the key has to be
 		# written into the plist or the agent quietly loses interpretation.
 		"ANTHROPIC_API_KEY",
@@ -1823,6 +1881,11 @@ def doctor() -> None:
 		check(working, f"replies {how}")
 	if agent_mode != "off" and LLM_MODE != "off" and anthropic is None:
 		print("        python3 -m pip install anthropic to have Claude read them")
+	agent_push = agent.get("WATER_PUSH_URL") or PUSH_URL
+	if agent_push:
+		print(f"        nudges also pushed to {agent_push}")
+	else:
+		print("        no push channel: WATER_PUSH_URL unset, so nudges rely on iMessage alone")
 	print(f"        state file {STATE_PATH.resolve()}")
 	state = load_state(quarantine=False)
 	if state is None:
@@ -1980,7 +2043,15 @@ def main(argv: list[str]) -> None:
 		tracker.add(ounces, "cli")
 		print(f"Logged {ounces:g} oz. {tracker.progress_line()}")
 	elif command == "test":
-		tracker.send(f"\U0001f4a7 Water tracker is connected. {tracker.progress_line()}")
+		# push=True on purpose: this command exists to prove delivery, and the
+		# push is now the half that actually notifies.
+		tracker.send(
+			f"\U0001f4a7 Water tracker is connected. {tracker.progress_line()}", push=True
+		)
+		if PUSH_URL:
+			print(f"Also pushed to {PUSH_URL}")
+		else:
+			print("No WATER_PUSH_URL set, so nothing was pushed.")
 	elif command == "run":
 		tracker.run()
 	else:
