@@ -63,6 +63,7 @@ Replies can be whole sentences — amounts and commands are picked out of the te
 	pause / resume                     stop or restart today's nudges
 """
 
+import base64
 import json
 import os
 import plistlib
@@ -192,6 +193,16 @@ UNITS = {
 	"gallon": 128.0,
 	"gallons": 128.0,
 }
+
+# The container words worth offering a vision model, singular only. Measures are
+# left out: "oz" and "ml" are not things you can point a camera at, and "sip" and
+# "gulp" describe a mouthful rather than the object being photographed. Naming
+# these in the prompt is what lets a recognised container resolve to the table's
+# figure instead of the model's guess at it.
+UNITS_FOR_PROMPT = frozenset({
+	"cup", "glass", "bottle", "water bottle", "mug", "can", "pint",
+	"tumbler", "shaker", "nalgene", "hydroflask", "quart", "jug", "gallon",
+})
 
 # argv keeps the phone number and body out of the script source, so a reply
 # containing quotes or AppleScript syntax cannot escape into the command.
@@ -336,6 +347,16 @@ FAST_PATH_FILLER = frozenset({
 })
 FAST_PATH_WORDS = FAST_PATH_FILLER | set(NUMBER_WORDS) | {unit for unit in UNITS if unit}
 FAST_PATH = os.getenv("WATER_FAST_PATH", "on").strip().lower() not in ("0", "off", "no")
+
+# Photos of a container, for the case the units table cannot cover: a bottle you
+# own but have no name for. Off is a supported answer — this is the slow path by
+# definition, since an image is no use to the pattern matching underneath.
+PHOTOS = os.getenv("WATER_PHOTOS", "on").strip().lower() not in ("0", "off", "no")
+# iPhone photos arrive as HEIC, which the API does not take, and at a resolution
+# far past anything useful for "what kind of bottle is this". sips converts and
+# downscales in one call.
+PHOTO_MAX_PX = int(os.getenv("WATER_PHOTO_MAX_PX", "1024"))
+PHOTO_TYPES = ("image/heic", "image/heif", "image/png", "image/jpeg", "image/webp", "image/gif")
 
 
 def fast_path_ounces(text: str) -> float | None:
@@ -506,6 +527,50 @@ Rules:
 - Amounts above 400 oz are a mistake; treat those as chat and ask.
 - Unused fields must be null."""
 
+PHOTO_SCHEMA = {
+	"type": "object",
+	"properties": {
+		"container": {
+			"type": ["string", "null"],
+			"description": (
+				"What the container is, in one or two words, lowercase. Use one of "
+				f"these words when it fits: {', '.join(sorted(UNITS_FOR_PROMPT))}. "
+				"Null if the picture shows no drink container."
+			),
+		},
+		"ounces": {
+			"type": ["number", "null"],
+			"description": (
+				"How much the container holds when full, in US fluid ounces. Your "
+				"best estimate of its capacity, not of how much is left in it. "
+				"Null if you cannot tell."
+			),
+		},
+		"note": {
+			"type": ["string", "null"],
+			"description": "One short clause on what you saw, or why you could not tell.",
+		},
+	},
+	"required": ["container", "ounces", "note"],
+	"additionalProperties": False,
+}
+
+PHOTO_PROMPT = """\
+You are shown a photo sent to a water-intake tracker. The sender is telling you \
+what they drank from, usually because it is a container they have no name for.
+
+Report what the container is and how much it holds when full. Capacity is a \
+property of the object, so estimate it from the kind of thing it is — a standard \
+single-serve water bottle is about 17 oz, a pint glass 16, a large insulated \
+flask 32, a mug 10, a soda can 12.
+
+Do not estimate how much liquid is currently in it, and do not estimate how much \
+the sender drank. You cannot see either reliably, and a wrong number there is \
+worse than no number: say what the container is and let them correct the amount.
+
+If the photo has no drink container in it, set container and ounces to null and \
+say so in the note."""
+
 _llm_client = None
 _llm_broken = False
 
@@ -575,6 +640,127 @@ def llm_check() -> tuple[bool, str]:
 	except Exception as error:
 		return False, f"pattern matching: {type(error).__name__}: {error}"
 	return True, f"read by {LLM_MODEL}, with pattern matching as the fallback"
+
+
+def normalise_photo(path: Path) -> bytes | None:
+	"""A photo as JPEG bytes the API will accept, or None if it cannot be.
+
+	Two problems at once. iPhone photos are HEIC, which the API does not take,
+	and they are several megabytes at a resolution far beyond what "what kind of
+	bottle is this" needs. sips is in the base system and fixes both in one
+	pass, so nothing has to be installed to make photos work.
+	"""
+	try:
+		with tempfile.TemporaryDirectory() as tmp:
+			out = Path(tmp) / "photo.jpg"
+			done = subprocess.run(
+				["sips", "-s", "format", "jpeg", "-Z", str(PHOTO_MAX_PX),
+				 str(path), "--out", str(out)],
+				capture_output=True, text=True, timeout=20,
+			)
+			if done.returncode != 0 or not out.exists():
+				detail = done.stderr.strip().splitlines()
+				print(f"   could not convert {path.name}: {detail[-1] if detail else 'sips failed'}")
+				return None
+			return out.read_bytes()
+	except subprocess.TimeoutExpired:
+		print(f"   gave up converting {path.name} after 20s")
+		return None
+	except OSError as error:
+		print(f"   could not read {path.name}: {error}")
+		return None
+
+
+def llm_photo_plan(path: Path) -> dict | None:
+	"""Ask Claude what container is in a photo. None whenever it cannot say."""
+	if not llm_ready() or not PHOTOS:
+		return None
+	client = llm_client()
+	if client is None:
+		return None
+	jpeg = normalise_photo(path)
+	if jpeg is None:
+		return None
+	block = {
+		"type": "image",
+		"source": {
+			"type": "base64",
+			"media_type": "image/jpeg",
+			"data": base64.standard_b64encode(jpeg).decode("ascii"),
+		},
+	}
+	output_config: dict = {"format": {"type": "json_schema", "schema": PHOTO_SCHEMA}}
+	if LLM_EFFORT:
+		output_config["effort"] = LLM_EFFORT
+	try:
+		response = client.with_options(timeout=LLM_TIMEOUT * 2, max_retries=0).messages.create(
+			model=LLM_MODEL,
+			max_tokens=512,
+			system=PHOTO_PROMPT,
+			# A longer timeout than the text path: an image is a far bigger
+			# request, and there is no pattern matching to fall back to, so
+			# giving up early here just loses the message.
+			messages=[{"role": "user", "content": [block]}],
+			output_config=output_config,
+		)
+	except anthropic.AuthenticationError:
+		print("   photo reading failed: credentials rejected")
+		_disable_llm()
+		return None
+	except anthropic.NotFoundError:
+		print(f"   photo reading failed: no access to model {LLM_MODEL!r}")
+		_disable_llm()
+		return None
+	except anthropic.BadRequestError as error:
+		# The likely one: a model without vision, or an image the API rejects.
+		print(f"   photo reading failed: bad request ({error.message})")
+		return None
+	except anthropic.APITimeoutError:
+		print(f"   photo reading failed: no answer in {LLM_TIMEOUT * 2:g}s")
+		return None
+	except anthropic.APIConnectionError:
+		print("   photo reading failed: network unreachable")
+		return None
+	except anthropic.APIStatusError as error:
+		print(f"   photo reading failed: API error {error.status_code}")
+		return None
+	except Exception as error:
+		print(f"   photo reading failed: {type(error).__name__}: {error}")
+		return None
+	if response.stop_reason == "refusal":
+		print("   Claude declined to read that photo")
+		return None
+	try:
+		answer = next(b.text for b in response.content if b.type == "text")
+		return json.loads(answer)
+	except (StopIteration, json.JSONDecodeError, TypeError, AttributeError) as error:
+		print(f"   photo answer unusable: {error}")
+		return None
+
+
+def photo_amount(plan: dict) -> tuple[float, str] | None:
+	"""Ounces and how they were arrived at, or None if the photo said nothing.
+
+	The units table wins wherever it recognises the container, so a photo of a
+	nalgene logs the same 32 oz that typing "nalgene" would. Only a container
+	the table has never heard of falls back to the model's own figure, and the
+	caller says which of the two happened so a wrong one can be corrected.
+	"""
+	container = (plan.get("container") or "").strip().lower()
+	singular = container.rstrip("s")
+	# Matched against the container words only, never the whole units table.
+	# That table also carries bare measures, and an empty key standing for "a
+	# number with no unit means ounces" — which matched a photo with no
+	# container in it at all and logged one ounce for a picture of nothing.
+	if container and (container in UNITS_FOR_PROMPT or singular in UNITS_FOR_PROMPT):
+		known = UNITS.get(container) or UNITS.get(singular)
+		if known:
+			return known, f"read that as a {container}"
+	ounces = plan.get("ounces")
+	if not isinstance(ounces, (int, float)) or not 0 < ounces <= MAX_LOG_OZ:
+		return None
+	label = container or "that"
+	return round(float(ounces), 1), f"guessed {label} holds about {ounces:g} oz"
 
 
 def sane_plan(plan: dict) -> dict | None:
@@ -756,6 +942,7 @@ class WaterTracker:
 		if not all(isinstance(echo, list) and len(echo) == 2 for echo in self.state["sent_echoes"]):
 			self.state["sent_echoes"] = []
 		self.reply_warning_shown = False
+		self.photo_warning_shown = False
 		self.last_db_stamp = None
 
 	# ----- state -----
@@ -928,8 +1115,12 @@ class WaterTracker:
 			marks.append((suffix, info.st_mtime_ns, info.st_size))
 		return tuple(marks) or None
 
-	def read_replies(self) -> list[tuple[int, str]]:
+	def read_replies(self) -> list[tuple[int, str, list[Path]]]:
 		"""Incoming messages from WATER_PHONE that we have not processed yet.
+
+		Each entry is the row id, the text, and any photo attachments — a photo
+		arrives as a message with no body at all, so the text alone is not
+		enough to tell an empty message from a picture of a water bottle.
 
 		The live database is copied first: Messages holds it open in WAL mode, so
 		reading it in place either blocks or misses the newest rows.
@@ -969,6 +1160,35 @@ class WaterTracker:
 						"WHERE m.is_from_me = 0 AND m.ROWID > ? ORDER BY m.ROWID",
 						(self.state["last_rowid"] or 0,),
 					).fetchall()
+					# Photos live outside the message row: the body is empty (or
+					# just an object-replacement character) and the file is on
+					# disk, reachable only through this join.
+					#
+					# Caught separately from the message query on purpose. Losing
+					# photos is a missing feature; letting that failure escape
+					# would stop every text reply being read too, which is the
+					# whole product.
+					attachments: dict[int, list[Path]] = {}
+					if PHOTOS and rows:
+						try:
+							first = rows[0][0] - 1
+							for message_id, filename, mime in db.execute(
+								"SELECT j.message_id, a.filename, a.mime_type "
+								"FROM message_attachment_join j "
+								"JOIN attachment a ON a.ROWID = j.attachment_id "
+								"WHERE j.message_id > ?",
+								(first,),
+							):
+								if not filename or (mime or "").lower() not in PHOTO_TYPES:
+									continue
+								# Stored with a literal ~ for the home directory.
+								path = Path(filename).expanduser()
+								if path.exists():
+									attachments.setdefault(message_id, []).append(path)
+						except sqlite3.Error as error:
+							if not self.photo_warning_shown:
+								print(f"   could not read photo attachments: {error}")
+								self.photo_warning_shown = True
 			except sqlite3.Error as error:
 				print(f"   could not query Messages: {error}")
 				return []
@@ -980,9 +1200,13 @@ class WaterTracker:
 			if digits(handle) != mine and handle != self.phone:
 				continue
 			body = (text or "").strip() or decode_body(blob)
-			if not body:
+			# U+FFFC is the placeholder Messages puts where an attachment sits.
+			# Left in, it would read as a body and hide the photo behind it.
+			body = body.replace("\ufffc", "").strip()
+			photos = attachments.get(rowid, [])
+			if not body and not photos:
 				continue
-			if self.is_echo(body) or body.startswith(MARKER):
+			if body and (self.is_echo(body) or body.startswith(MARKER)):
 				continue
 			# A reply read long after it was sent is not safe to act on: the
 			# amount may belong to a previous day, and after any gap in reading
@@ -991,7 +1215,7 @@ class WaterTracker:
 			if sent_at and time.time() - sent_at > STALE_REPLY_MIN * 60:
 				stale += 1
 				continue
-			replies.append((rowid, body))
+			replies.append((rowid, body, photos))
 		if stale:
 			print(f"   skipped {stale} reply(s) older than {STALE_REPLY_MIN} min")
 		# Recorded only after a clean read, so a failed copy is retried on the
@@ -1064,6 +1288,36 @@ class WaterTracker:
 		self.save()
 		return f"Daily goal set to {self.goal:g} oz. {self.progress_line()}"
 
+	def log_photo(self, path: Path) -> None:
+		"""Log from a picture of a container, saying where the number came from.
+
+		There is no pattern matching underneath this one, so a failure has to be
+		answered in words rather than fallen through: a photo that goes
+		unacknowledged looks identical to a tracker that has stopped working.
+		"""
+		if not PHOTOS:
+			self.send("Photos are switched off here. Text an amount instead.")
+			return
+		if not llm_ready():
+			self.send("Can't read photos right now — Claude is unavailable. Text an amount instead.")
+			return
+		plan = llm_photo_plan(path)
+		if plan is None:
+			self.send("Couldn't read that photo. Text an amount instead.")
+			return
+		amount = photo_amount(plan)
+		if amount is None:
+			note = (plan.get("note") or "").strip()
+			tail = f" {note[:MAX_CHAT_CHARS]}" if note else ""
+			self.send(f"Couldn't tell what that holds.{tail} How much was it?")
+			return
+		ounces, how = amount
+		print(f"   photo read as {ounces:g} oz ({how})")
+		# Always invites a correction, because the container is identified
+		# rather than measured: the number is the container's capacity, not a
+		# reading of what was actually swallowed.
+		self.log_reply(ounces, f" I {how} — text an amount to correct it.")
+
 	def log_reply(self, ounces: float, note: str = "") -> None:
 		self.add(ounces, "reply")
 		if self.total() < self.goal:
@@ -1110,8 +1364,8 @@ class WaterTracker:
 		else:
 			self.send(f"{plan['chat']}\n{self.progress_line()}")
 
-	def handle_reply(self, body: str) -> None:
-		print(f"<- {body}")
+	def handle_reply(self, body: str, photos: list[Path] | None = None) -> None:
+		print(f"<- {body}" + (f" [{len(photos)} photo(s)]" if photos else ""))
 		# Any reply answers the outstanding nudge, whatever it turns out to
 		# mean. Someone texting 'status' or 'not yet' has the phone in hand, so
 		# a follow-up would be chasing a person who is plainly already there.
@@ -1119,6 +1373,10 @@ class WaterTracker:
 		# still counts as having been answered.
 		self.state["awaiting_reply_since"] = None
 		self.save()
+		if photos and not body:
+			self.log_photo(photos[0])
+			return
+
 		text = body.strip().lower()
 
 		# Answered without the network when the message is only an amount, so
@@ -1360,8 +1618,8 @@ class WaterTracker:
 						print(f"   forgot {dropped} day(s) older than {KEEP_DAYS} days")
 					self.save()
 				try:
-					for _, body in self.read_replies():
-						self.handle_reply(body)
+					for _, body, photos in self.read_replies():
+						self.handle_reply(body, photos)
 				except Exception as error:  # keep the loop alive across transient failures
 					print(f"   error reading replies: {error}")
 				# Separate from the block above: a failure while reading replies

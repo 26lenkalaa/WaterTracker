@@ -7,15 +7,19 @@ captured in a list, STATE_PATH is redirected into a temp directory, and the
 Claude client is a stand-in that records what it was asked.
 """
 
+import base64
 import importlib.util
 import io
 import json
 import os
 import shutil
 import sqlite3
+import struct
+import subprocess
 import tempfile
 import time
 import unittest
+import zlib
 from contextlib import closing, redirect_stdout
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -954,6 +958,238 @@ class WeekTest(TrackerTestCase):
 		self.assertEqual(self.tracker.total(), 0, "a question logged an amount")
 
 
+class NormalisePhotoTest(unittest.TestCase):
+	"""The sips conversion, run for real: HEIC is what iPhones actually send."""
+
+	def setUp(self):
+		folder = tempfile.TemporaryDirectory()
+		self.addCleanup(folder.cleanup)
+		self.folder = Path(folder.name)
+
+	def seed_png(self, width=64, height=64):
+		"""A valid PNG, built here so the suite carries no binary fixtures.
+
+		Written by hand rather than pasted as base64: a 2x2 image is a legal
+		PNG that sips refuses to read (pixelWidth comes back nil), which
+		skipped the HEIC test — the one thing in this class worth testing.
+		"""
+		raw = b"".join(b"\x00" + bytes((70, 130, 180)) * width for _ in range(height))
+
+		def chunk(tag, data):
+			body = tag + data
+			return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+		path = self.folder / "seed.png"
+		path.write_bytes(
+			b"\x89PNG\r\n\x1a\n"
+			+ chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+			+ chunk(b"IDAT", zlib.compress(raw, 9))
+			+ chunk(b"IEND", b"")
+		)
+		return path
+
+	def make_image(self, name, fmt):
+		"""A real image on disk, converted by sips so no library is needed."""
+		target = self.folder / name
+		done = subprocess.run(
+			["sips", "-s", "format", fmt, str(self.seed_png()), "--out", str(target)],
+			capture_output=True, text=True,
+		)
+		if done.returncode != 0 or not target.exists():
+			self.skipTest(f"this machine's sips cannot write {fmt}")
+		return target
+
+	def test_converts_heic_to_jpeg(self):
+		# The whole reason this function exists: the API takes JPEG, PNG, GIF
+		# and WebP, and an iPhone sends HEIC.
+		heic = self.make_image("IMG_0001.HEIC", "heic")
+		data = wt.normalise_photo(heic)
+		self.assertIsNotNone(data, "HEIC came back unconverted")
+		self.assertTrue(data.startswith(b"\xff\xd8\xff"), "not JPEG bytes")
+
+	def test_converts_png_too(self):
+		data = wt.normalise_photo(self.make_image("shot.png", "png"))
+		self.assertTrue(data.startswith(b"\xff\xd8\xff"))
+
+	def test_a_missing_file_is_not_fatal(self):
+		self.assertIsNone(wt.normalise_photo(self.folder / "nope.heic"))
+
+	def test_a_file_that_is_not_an_image_is_not_fatal(self):
+		junk = self.folder / "notes.heic"
+		junk.write_bytes(b"this is not an image at all")
+		self.assertIsNone(wt.normalise_photo(junk))
+
+
+class PhotoAmountTest(unittest.TestCase):
+	"""Turning a container into ounces, and where that number comes from."""
+
+	def test_a_known_container_uses_the_units_table(self):
+		# The design rule: a recognised container resolves to the same figure
+		# typing its name would, not to whatever the model guessed.
+		for container, expected in (("nalgene", 32.0), ("pint", 16.0), ("mug", 10.0),
+		                            ("can", 12.0), ("hydroflask", 32.0), ("glass", 8.0)):
+			with self.subTest(container=container):
+				ounces, how = wt.photo_amount(
+					{"container": container, "ounces": 999, "note": None}
+				)
+				self.assertEqual(ounces, expected, "used the model's number over the table")
+				self.assertIn(container, how)
+
+	def test_plurals_and_capitals_still_match_the_table(self):
+		for container in ("Nalgene", "PINTS", " mugs "):
+			with self.subTest(container=container):
+				ounces, _ = wt.photo_amount({"container": container, "ounces": 999, "note": None})
+				self.assertIn(ounces, (32.0, 16.0, 10.0))
+
+	def test_an_unknown_container_falls_back_to_the_estimate(self):
+		ounces, how = wt.photo_amount(
+			{"container": "insulated growler", "ounces": 40, "note": None}
+		)
+		self.assertEqual(ounces, 40.0)
+		self.assertIn("guessed", how, "an estimate was not labelled as one")
+		self.assertIn("growler", how)
+
+	def test_a_bare_measure_is_not_treated_as_a_container(self):
+		# "oz" is in UNITS at 1.0. Matching it would log one ounce for a photo
+		# of a bottle, which is worse than falling back to the estimate.
+		ounces, how = wt.photo_amount({"container": "oz", "ounces": 24, "note": None})
+		self.assertEqual(ounces, 24.0)
+		self.assertIn("guessed", how)
+
+	def test_nothing_usable_is_none(self):
+		for plan in (
+			{"container": None, "ounces": None, "note": "no container here"},
+			{"container": "growler", "ounces": 0, "note": None},
+			{"container": "growler", "ounces": -5, "note": None},
+			{"container": "growler", "ounces": 9000, "note": None},
+			{"container": "growler", "ounces": "big", "note": None},
+			{"container": None, "ounces": None, "note": None},
+		):
+			with self.subTest(plan=plan):
+				self.assertIsNone(wt.photo_amount(plan))
+
+
+class LogPhotoTest(TrackerTestCase):
+	"""Answering a photo, including when it cannot be read."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "PHOTOS", True)
+		self.photo = self.state_path.with_name("IMG.HEIC")
+		self.photo.write_bytes(b"stand-in")
+
+	def stub(self, plan):
+		self.patch(wt, "llm_photo_plan", lambda path: plan)
+		self.patch(wt, "llm_ready", lambda: True)
+
+	def test_a_recognised_container_is_logged_with_its_table_value(self):
+		self.stub({"container": "nalgene", "ounces": 30, "note": "a big blue flask"})
+		self.tracker.log_photo(self.photo)
+		self.assertEqual(self.tracker.total(), 32)
+		self.assertIn("correct it", self.sent[-1], "logged a guess without inviting a fix")
+
+	def test_an_unreadable_photo_is_answered_not_ignored(self):
+		# There is no pattern matching under this path, so silence would look
+		# exactly like a tracker that had stopped working.
+		self.stub(None)
+		self.tracker.log_photo(self.photo)
+		self.assertEqual(self.tracker.total(), 0)
+		self.assertIn("Couldn't read", self.sent[-1])
+
+	def test_a_photo_with_no_container_asks_rather_than_guesses(self):
+		self.stub({"container": None, "ounces": None, "note": "that is a cat"})
+		self.tracker.log_photo(self.photo)
+		self.assertEqual(self.tracker.total(), 0)
+		self.assertIn("How much", self.sent[-1])
+		self.assertIn("cat", self.sent[-1], "dropped the model's explanation")
+
+	def test_switched_off_says_so(self):
+		self.patch(wt, "PHOTOS", False)
+		self.tracker.log_photo(self.photo)
+		self.assertIn("switched off", self.sent[-1])
+		self.assertEqual(self.tracker.total(), 0)
+
+	def test_claude_unavailable_says_so(self):
+		self.patch(wt, "llm_ready", lambda: False)
+		self.tracker.log_photo(self.photo)
+		self.assertIn("unavailable", self.sent[-1])
+		self.assertEqual(self.tracker.total(), 0)
+
+	def test_a_photo_with_a_caption_is_read_as_text(self):
+		# A caption means the pattern matching can do the job for free, so the
+		# photo path is skipped entirely.
+		self.stub({"container": "nalgene", "ounces": 32, "note": None})
+		self.tracker.handle_reply("16 oz", [self.photo])
+		self.assertEqual(self.tracker.total(), 16, "spent a vision call on a captioned amount")
+
+
+class PhotoRequestTest(LlmTestCase):
+	"""The vision request itself, against the stand-in client."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch_photos(True)
+		folder = tempfile.TemporaryDirectory()
+		self.addCleanup(folder.cleanup)
+		self.jpeg = Path(folder.name) / "x.jpg"
+		self.jpeg.write_bytes(b"\xff\xd8\xff" + b"0" * 40)
+		self.patch(wt, "normalise_photo", lambda path: self.jpeg.read_bytes())
+
+	def patch(self, module, name, value):
+		previous = getattr(module, name)
+		setattr(module, name, value)
+		self.addCleanup(setattr, module, name, previous)
+
+	def patch_photos(self, value):
+		self.patch(wt, "PHOTOS", value)
+
+	def test_sends_the_image_as_base64_jpeg(self):
+		client = self.install(fake_answer({"container": "pint", "ounces": 16, "note": None}))
+		wt.llm_photo_plan(self.jpeg)
+
+		request = client.requests[0]
+		block = request["messages"][0]["content"][0]
+		self.assertEqual(block["type"], "image")
+		self.assertEqual(block["source"]["type"], "base64")
+		self.assertEqual(block["source"]["media_type"], "image/jpeg")
+		self.assertEqual(base64.b64decode(block["source"]["data"]), self.jpeg.read_bytes())
+		self.assertEqual(request["output_config"]["format"]["schema"], wt.PHOTO_SCHEMA)
+		self.assertIn("container", request["system"])
+
+	def test_allows_longer_than_the_text_path(self):
+		# An image is a much bigger request and has no fallback beneath it.
+		client = self.install(fake_answer({"container": "pint", "ounces": 16, "note": None}))
+		wt.llm_photo_plan(self.jpeg)
+		self.assertGreater(client.options[0]["timeout"], wt.LLM_TIMEOUT)
+		self.assertEqual(client.options[0]["max_retries"], 0)
+
+	def test_switched_off_makes_no_request(self):
+		client = self.install(fake_answer({"container": "pint", "ounces": 16, "note": None}))
+		self.patch_photos(False)
+		self.assertIsNone(wt.llm_photo_plan(self.jpeg))
+		self.assertEqual(client.requests, [])
+
+	def test_a_model_without_vision_is_reported_not_raised(self):
+		client = self.install(None)
+		client.outcome = wt.anthropic.BadRequestError("no vision on this model")
+		self.assertIsNone(wt.llm_photo_plan(self.jpeg))
+
+	def test_every_failure_mode_returns_none(self):
+		for name in ("AuthenticationError", "NotFoundError", "BadRequestError",
+		             "APITimeoutError", "APIConnectionError", "APIStatusError"):
+			with self.subTest(error=name):
+				client = self.install(None)
+				self.patch(wt, "normalise_photo", lambda path: b"\xff\xd8\xfftest")
+				client.outcome = getattr(wt.anthropic, name)("boom")
+				self.assertIsNone(wt.llm_photo_plan(self.jpeg))
+
+	def test_an_unconvertible_photo_never_reaches_the_api(self):
+		client = self.install(fake_answer({"container": "pint", "ounces": 16, "note": None}))
+		self.patch(wt, "normalise_photo", lambda path: None)
+		self.assertIsNone(wt.llm_photo_plan(self.jpeg))
+		self.assertEqual(client.requests, [], "uploaded an image that failed to convert")
+
+
 class ReadRepliesTest(TrackerTestCase):
 	"""The reply path against a stand-in for the Messages database."""
 
@@ -972,6 +1208,12 @@ class ReadRepliesTest(TrackerTestCase):
 			"CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, "
 			"attributedBody BLOB, handle_id INTEGER, is_from_me INTEGER, date INTEGER)"
 		)
+		self.db.execute(
+			"CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT, mime_type TEXT)"
+		)
+		self.db.execute(
+			"CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER)"
+		)
 		self.db.execute("INSERT INTO handle VALUES (1, ?)", (self.tracker.phone,))
 		self.db.execute("INSERT INTO handle VALUES (2, '+15559998888')")
 		self.db.commit()
@@ -985,8 +1227,64 @@ class ReadRepliesTest(TrackerTestCase):
 		)
 		self.db.commit()
 
+	def attach(self, name="IMG_0001.HEIC", mime="image/heic", make_file=True):
+		"""Hang an attachment off the most recent message, as Messages does."""
+		message_id = self.db.execute("SELECT MAX(ROWID) FROM message").fetchone()[0]
+		path = self.state_path.with_name(name)
+		if make_file:
+			path.write_bytes(b"not really an image")
+		self.db.execute("INSERT INTO attachment (filename, mime_type) VALUES (?, ?)",
+		                (str(path), mime))
+		attachment_id = self.db.execute("SELECT MAX(ROWID) FROM attachment").fetchone()[0]
+		self.db.execute("INSERT INTO message_attachment_join VALUES (?, ?)",
+		                (message_id, attachment_id))
+		self.db.commit()
+		return path
+
+	def test_a_broken_attachment_table_does_not_stop_text_replies(self):
+		# Photos are a feature; reading replies is the product. A failure in
+		# the attachment join has to cost the photos and nothing else.
+		self.db.execute("DROP TABLE message_attachment_join")
+		self.db.commit()
+		self.add_message("16 oz")
+		self.assertEqual(self.bodies(), ["16 oz"], "lost every reply over a photo query")
+
+	def test_a_photo_is_read_as_an_attachment_not_an_empty_message(self):
+		self.add_message("")
+		path = self.attach()
+		self.assertEqual(self.photos(), [[path]])
+
+	def test_the_attachment_placeholder_character_is_not_a_body(self):
+		# Messages puts U+FFFC where the attachment sits; left in, it reads as
+		# a body and hides the photo behind it.
+		self.add_message("￼")
+		self.attach()
+		rows = self.tracker.read_replies()
+		self.assertEqual(rows[0][1], "", "the placeholder was treated as text")
+		self.assertEqual(len(rows[0][2]), 1)
+
+	def test_a_video_is_not_offered_as_a_photo(self):
+		self.add_message("")
+		self.attach(name="clip.mov", mime="video/quicktime")
+		self.assertEqual(self.photos(), [], "queued a video for the vision model")
+
+	def test_an_attachment_whose_file_is_gone_is_skipped(self):
+		self.add_message("")
+		self.attach(make_file=False)
+		self.assertEqual(self.photos(), [], "queued a path that does not exist")
+
+	def test_a_captioned_photo_keeps_both_halves(self):
+		self.add_message("half of this")
+		path = self.attach()
+		rows = self.tracker.read_replies()
+		self.assertEqual(rows[0][1], "half of this")
+		self.assertEqual(rows[0][2], [path])
+
 	def bodies(self):
-		return [body for _, body in self.tracker.read_replies()]
+		return [body for _, body, _ in self.tracker.read_replies()]
+
+	def photos(self):
+		return [paths for _, _, paths in self.tracker.read_replies()]
 
 	def count_copies(self):
 		"""Start counting database copies; returns the growing list."""

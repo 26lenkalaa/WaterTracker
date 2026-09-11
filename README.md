@@ -106,6 +106,7 @@ the phrasings below.
 | `twenty five ounces` / `3/4 of a bottle` | logs 25 oz / 12.7 oz |
 | `done` / `yep` / `just finished one` / 👍 | logs one glass, and says it guessed |
 | `awake` / `good morning` / `gm` | starts the day now, and paces from this moment |
+| *a photo of a container* | identifies it and logs what it holds |
 | `not yet` / `in a bit` | pushes the next nudge out, without pausing |
 | `status` / `?` / `how am i doing` | today's progress |
 | `week` / `my weekly average` | last 7 days |
@@ -149,6 +150,8 @@ All optional except the phone number.
 | `WATER_LLM_TIMEOUT` | 8 | seconds before falling back to patterns |
 | `WATER_EFFORT` | — | thinking depth; only for models that accept it |
 | `WATER_FAST_PATH` | `on` | `off` to send even bare amounts to Claude |
+| `WATER_PHOTOS` | `on` | `off` to ignore photo attachments |
+| `WATER_PHOTO_MAX_PX` | 1024 | longest edge a photo is downscaled to |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
@@ -217,6 +220,48 @@ the interval when you're far behind, at the defaults (120 min interval, 60 min
 follow-up) it's already nudging hourly, so the follow-up is what covers the
 wider gaps when you're near or ahead of pace. Either way the effect is a
 one-hour ceiling on silence after a text you didn't answer.
+
+### Sending a photo of a container
+
+For the container you own but have no name for. Text it a picture and it names
+the thing and logs what that thing holds:
+
+```
+Me   14:20   [photo of a 32 oz flask]
+You  14:20   💧 Logged 32 oz. ███░░░░░░░ 32/100 oz (32%) — 68 oz to go.
+              I read that as a hydroflask — text an amount to correct it.
+```
+
+**The units table wins wherever it recognises the container.** A photo read as
+a `nalgene` logs the same 32 oz that typing "nalgene" would — the model picks
+the category, the table supplies the number. Only a container the table has
+never heard of falls back to the model's own capacity estimate, and the reply
+says which of the two happened (`read that as a…` versus `guessed … holds
+about…`) so a wrong one can be corrected.
+
+That split is deliberate, and it is the same rule the text path follows: the
+model classifies, the log and the tables supply every figure. It also sets the
+limit of what this can do. **It reads the container, not the contents** — it is
+told not to guess how full the glass is or how much you drank, because a photo
+does not reliably show either and a confident wrong number is worse than a
+question. A picture with no drink container in it gets *"couldn't tell what
+that holds — how much was it?"* rather than an invented amount.
+
+Three things worth knowing:
+
+- **HEIC is converted first.** iPhones send HEIC, which the API does not
+  accept, at a resolution far past what "what kind of bottle is this" needs.
+  `sips` (in the base system, nothing to install) converts and downscales in
+  one pass. The test suite runs a real PNG → HEIC → JPEG round trip rather
+  than trusting that.
+- **A caption skips the whole path.** Send a photo with `16 oz` attached and
+  the text is used, because the pattern matching answers for free in
+  milliseconds and a vision call would be pure cost.
+- **It's the slow path by design.** An image is roughly 1,500 tokens against
+  about 30 for `28 oz`, there's no pattern matching underneath it to fall back
+  on, and it gets double the usual timeout for that reason. A failure is
+  always answered in words — silence here is indistinguishable from a tracker
+  that has stopped working. `WATER_PHOTOS=off` turns it off.
 
 ## How it works
 
@@ -311,7 +356,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 134 tests, ~0.07s
+python3 -m unittest discover .        # 161 tests, ~0.09s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
