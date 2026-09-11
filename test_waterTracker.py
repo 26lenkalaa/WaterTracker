@@ -276,6 +276,19 @@ class InstallTest(unittest.TestCase):
 		self.assertEqual(settings["ANTHROPIC_API_KEY"], "sk-ant-test")
 		self.assertEqual(wt.PLIST_PATH.stat().st_mode & 0o077, 0, "the key is readable by others")
 
+	def test_every_setting_reaches_the_agent(self):
+		# launchd inherits nothing, so a setting missing from this list is one
+		# you can export, see work in the foreground, and never get from the
+		# background job. Six were missing when this test was written.
+		import re
+		source = Path(wt.__file__).read_text()
+		declared = set(re.findall(r'os\.getenv\("(WATER_[A-Z_]+)"', source))
+		block = re.search(r"for name in \(\s*(.*?)\s*\):", source, re.S).group(1)
+		carried = set(re.findall(r'"([A-Z_]+)"', block))
+		# Both of these are written explicitly above the loop, not through it.
+		carried |= {"WATER_PHONE", "WATER_STATE_FILE"}
+		self.assertEqual(declared - carried, set(), "settings the LaunchAgent never sees")
+
 	def test_no_key_no_key_in_the_plist(self):
 		os.environ.pop("ANTHROPIC_API_KEY", None)
 		settings = self.install_with(WATER_PHONE="+15551234567")
