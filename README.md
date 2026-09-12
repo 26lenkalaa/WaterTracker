@@ -90,7 +90,7 @@ python3 waterTracker.py install    # write the LaunchAgent
 
 `status`, `week` and `log` don't need `WATER_PHONE` — only sending does.
 
-`status` draws the day, and `log` prints it back after adding to it:
+`status` draws the day — the bar, what's left, and where each entry came from:
 
 ```
 $ python3 waterTracker.py status
@@ -102,8 +102,26 @@ $ python3 waterTracker.py status
 
   01:29    40.3 oz  reply
   15:25      20 oz  reply
+```
 
-  🔥 3 day streak at goal
+Once the goal is met the bar turns green and the second line says by how much —
+`goal met, 24 oz past it` — and a run of days at goal adds a
+`🔥 4 day streak at goal` line under the entries.
+
+`log` adds an amount without texting anything, then prints the same view back:
+
+```
+$ python3 waterTracker.py log 16
+✓ logged 16 oz
+
+💧 Water · Sat Sep 12
+
+  ███████████████████▏░░░░░░░░░░░░  60%
+  76.3 / 128 oz  ·  51.7 oz to go
+
+  01:29    40.3 oz  reply
+  15:25      20 oz  reply
+  18:43      16 oz  cli
 ```
 
 `week` scales its bars to the best day rather than to the goal, so a day that
@@ -196,6 +214,7 @@ All optional except the phone number.
 | `WATER_PUSH_URL` | — | push nudges here as well as texting them |
 | `WATER_PUSH_TIMEOUT` | 10 | seconds before a push gives up |
 | `WATER_PUSH_ONLY` | — | `on` to push instead of texting, not as well |
+| `NO_COLOR` | — | set to anything to turn off terminal colour |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
 of an even pace for the time of day and tightens toward half when you're behind.
@@ -443,7 +462,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 179 tests, ~0.10s
+python3 -m unittest discover .        # 192 tests, ~0.4s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
@@ -485,6 +504,28 @@ and 404 cases that have something specific to say, and the suite could not
 tell. The stand-in now mirrors the real hierarchy, and reordering either
 `except` chain fails.
 
+The terminal output was mutated the same way. Painting the bar inside
+`progress_line`, dropping the `NO_COLOR` and `TERM=dumb` gate, removing the
+zero-goal guard from `streak`, or nesting a painted meter back inside a dimmed
+line each fails a named test. The first of those is the one that matters: the
+failure prints the exact escape sequence that would have been texted to a
+phone, which is where a colour bug in this program actually costs something.
+
+Two rules are asserted rather than described. Nothing the tracker sends may
+contain an escape, checked with colour forced fully on across every reply the
+tracker answers — and within one reset-delimited run of painted output there is
+at most one group of opening codes, with no line ending on a style left open.
+That second rule caught a real defect: `paint` closes with a plain reset, which
+ends *all* styling rather than the one it opened, so a painted meter appended
+to a dimmed line closed the dim early. It rendered correctly only because the
+meter happened to be last on the line.
+
+Writing that check exposed a weakness in the check itself. The first version
+anchored its regex to the start of a run, so leading plain text before the
+escape defeated it and the assertion passed against output that was genuinely
+broken. Mutation is what caught it: the rule only earns its place once the bug
+it describes can make it fail.
+
 The Claude request shape is verified against the stand-in client, not the live
 API — model, JSON schema, effort and timeout are asserted, and the startup
 check's arguments are checked against the installed SDK's signature, but no
@@ -520,12 +561,45 @@ The ticks are green and the failures red on a terminal. Piped to a file, into a
 bug report, or with `NO_COLOR` set, the same run prints `ok` and `FAIL` in
 place of the glyphs and no escape sequences at all.
 
+When something *is* wrong, the failing lines are red and collected again at the
+bottom, because a list this long is easy to skim past:
+
+```
+$ python3 waterTracker.py doctor
+
+💧 Water tracker checkup
+
+  ✗  'not-a-phone' from the environment is not a phone number or email; Messages will refuse it
+  ✗  replies pattern matching: no credentials, set ANTHROPIC_API_KEY
+     no push channel: WATER_PUSH_URL unset, so nudges rely on iMessage alone
+     state file /Users/you/WaterTracker/water_tracker_state.json
+  ✓  state file exists
+  ✓  this python can read Messages history, so replies are picked up
+  ✗  no LaunchAgent, so reminders stop with the terminal (try 'install')
+  ✓  loop running (pid 31400)
+  ✓  not paused
+  ✓  inside the 8:00-22:00 nudge window
+  ✗  no nudge has been sent yet
+     nothing awaiting a reply; follow-up after 60 min of silence
+     today 0/100 oz ░░░░░░░░░░░░░░░░░░░░
+
+  4 problem(s) to fix:
+    • 'not-a-phone' from the environment is not a phone number or email; Messages will refuse it
+    • replies pattern matching: no credentials, set ANTHROPIC_API_KEY
+    • no LaunchAgent, so reminders stop with the terminal (try 'install')
+    • no nudge has been sent yet
+```
+
+A clean run says so in one line instead, which is the point: `doctor` prints
+the same dozen checks either way, and without a verdict at the end an all-green
+report reads like a wall of text you still have to audit yourself.
+
 That follow-up line reads as a fact rather than a check, because both states
 are normal. It's what explains a text that arrived off the interval — or one
 that didn't:
 
 ```
-        nudge unanswered for 74 min, follow-up at 60 min (already sent)
+     nudge unanswered for 74 min, follow-up at 60 min (already sent)
 ```
 
 The replies line is a live check, not a reading of the configuration: it counts
