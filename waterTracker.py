@@ -2039,10 +2039,12 @@ def doctor() -> None:
 			# in a log or a pasted bug report, so it stays word-for-word.
 			print(f"  {'ok  ' if good else 'FAIL'}  {what}")
 
-	def detail(text: str) -> None:
+	def detail(text: str, suffix: str = "") -> None:
 		# Indented to sit under a check's text, and the two markers are not the
-		# same width: "  ✓  " against the plain "  ok    ".
-		print(f"{'     ' if colour_ready() else '        '}{paint(text, 'dim')}")
+		# same width: "  ✓  " against the plain "  ok    ". Anything already
+		# carrying its own colour goes in suffix, outside the dim.
+		indent = "     " if colour_ready() else "        "
+		print(f"{indent}{paint(text, 'dim')}{f' {suffix}' if suffix else ''}")
 
 	heading("💧 Water tracker checkup")
 	installed = installed_agent()
@@ -2202,7 +2204,10 @@ def doctor() -> None:
 			why = f" (in {FOLLOWUP_MIN - held:.0f} min)"
 		detail(f"nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{why}")
 	if goal:
-		detail(f"today {total:g}/{goal:g} oz {meter(total / goal, bar_width(40, longest=20))}")
+		# The meter paints itself, so it is appended rather than passed through
+		# detail(): nesting it inside the dim would close that dim early and
+		# leave anything after it unstyled.
+		detail(f"today {total:g}/{goal:g} oz", suffix=meter(total / goal, bar_width(40, longest=20)))
 	else:
 		detail(f"today {total:g} oz, no goal set")
 

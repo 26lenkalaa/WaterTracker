@@ -1287,6 +1287,24 @@ class TerminalOutputTest(TrackerTestCase):
 		self.assertEqual(len(rows), 3, "not one row per day")
 		self.assertIn("0 of 3 days at goal", output)
 
+	def assert_styles_do_not_nest(self, text):
+		"""Every painted run opens, prints, and resets -- without another inside it.
+
+		paint() closes with a plain reset, which ends *all* styling rather than
+		the one it opened. So a painted string dropped inside another one cuts
+		the outer style short and leaves a stray reset behind; it only looks
+		right while the inner run happens to be last on the line.
+		"""
+		for line in text.splitlines():
+			runs = line.split("\033[0m")
+			for run in runs[:-1]:
+				# One run is: any plain text, then the codes paint() opened with,
+				# then the text they style. A second group of codes in the same
+				# run is one painted string sitting inside another.
+				opened = re.findall(r"(?:\033\[[0-9;]*m)+", run)
+				self.assertLessEqual(len(opened), 1, f"a painted run nested inside another: {line!r}")
+			self.assertNotIn("\033", runs[-1], f"a style was left open at the end of {line!r}")
+
 	def test_colour_only_ever_adds_escapes(self):
 		# The same view twice: stripping the escapes from the painted one has to
 		# give back the plain one, or colour is changing the content.
@@ -1294,7 +1312,26 @@ class TerminalOutputTest(TrackerTestCase):
 		self.setUp()
 		painted = self.render(["status"], colour=True)
 		self.assertIn("\033", painted, "colour was on but nothing was painted")
+		self.assert_styles_do_not_nest(painted)
 		self.assertEqual(re.sub(r"\033\[[0-9;]*m", "", painted), plain)
+
+	def test_every_painted_view_keeps_its_styles_flat(self):
+		for command in (["status"], ["week", "7"]):
+			with self.subTest(command=command):
+				self.setUp()
+				self.assert_styles_do_not_nest(self.render(command, colour=True))
+
+	def test_doctors_painted_output_keeps_its_styles_flat(self):
+		# Where it actually went wrong: a painted meter appended to a dimmed
+		# line, which closed the dim early and left a reset dangling.
+		self.patch(wt, "colour_ready", lambda: True)
+		self.patch(wt, "installed_agent", lambda: {})
+		self.patch(wt, "llm_check", lambda: (True, "read by a model"))
+		self.tracker.add(124, "cli")  # past the goal, so the meter has fill to paint
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.doctor()
+		self.assert_styles_do_not_nest(printed.getvalue())
 
 
 class NormalisePhotoTest(unittest.TestCase):
