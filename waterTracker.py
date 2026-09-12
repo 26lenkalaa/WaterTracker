@@ -967,6 +967,160 @@ def load_state(quarantine: bool = True) -> dict | None:
 		return {}
 
 
+# ----- terminal presentation -----
+#
+# Everything here is for a terminal and nothing else. The tracker's own
+# formatting -- progress_line, week_lines -- is what 'status' and 'week' text
+# back over iMessage, where an escape sequence arrives as literal gibberish and
+# cannot be taken back. So colour is added at the print site, never inside the
+# strings the tracker builds, and the message versions stay exactly as plain as
+# they were.
+
+STYLES = {
+	"reset": "\033[0m",
+	"bold": "\033[1m",
+	"dim": "\033[2m",
+	"red": "\033[31m",
+	"green": "\033[32m",
+	"yellow": "\033[33m",
+	"cyan": "\033[36m",
+}
+
+
+def colour_ready() -> bool:
+	"""True when stdout is a terminal that wants escapes.
+
+	Deliberately not cached. The agent's stdout is a log file, the tests
+	redirect it to a buffer, and a run started from a terminal has a real one;
+	the answer has to be whatever is true at the moment of the print.
+	"""
+	if os.getenv("NO_COLOR") is not None:  # no-color.org: set at all, even empty
+		return False
+	if os.getenv("TERM", "") in ("", "dumb"):
+		return False
+	try:
+		return sys.stdout.isatty()
+	except (AttributeError, ValueError):  # a closed or exotic stream
+		return False
+
+
+def paint(text: str, *styles: str) -> str:
+	if not text or not colour_ready():
+		return text
+	return "".join(STYLES[style] for style in styles) + text + STYLES["reset"]
+
+
+# Eighths, so the bar moves on a swallow rather than only every tenth of a
+# goal. The plain one in WaterTracker.bar stays whole blocks: it is read in a
+# text message, where partial glyphs render at the mercy of the font.
+EIGHTHS = " ▏▎▍▌▋▊▉█"
+
+
+def meter(fraction: float, width: int) -> str:
+	"""A painted bar, clamped to full, filled to the nearest eighth of a cell."""
+	fraction = max(0.0, min(1.0, fraction))
+	full, part = divmod(round(fraction * width * 8), 8)
+	bar = "█" * full + (EIGHTHS[part] if part else "")
+	tone = "green" if fraction >= 1 else "cyan"
+	return paint(bar, tone) + paint("░" * (width - len(bar)), "dim")
+
+
+def bar_width(reserved: int, longest: int = 32) -> int:
+	"""How wide a bar fits, given what shares its line."""
+	columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+	return max(10, min(longest, columns - reserved))
+
+
+def heading(text: str) -> None:
+	print(f"\n{paint(text, 'bold', 'cyan')}\n")
+
+
+def note(text: str, indent: str = "  ") -> None:
+	print(f"{indent}{paint(text, 'dim')}")
+
+
+def print_status(tracker: "WaterTracker") -> None:
+	total, goal = tracker.total(), tracker.goal
+	entries = tracker.entries()
+	heading(f"💧 Water · {date.today():%a %b %-d}")
+
+	if goal:
+		fraction = total / goal
+		percent = f"{fraction * 100:.0f}%".rjust(4)
+		tone = "green" if fraction >= 1 else "bold"
+		print(f"  {meter(fraction, bar_width(14))} {paint(percent, tone)}")
+		remaining = goal - total
+		if remaining > 0:
+			tail = paint(f"{remaining:g} oz to go", "dim")
+		else:
+			tail = paint(f"goal met{f', {-remaining:g} oz past it' if remaining else ''}", "green")
+		print(f"  {paint(f'{total:g} / {goal:g} oz', 'bold')}  {paint('·', 'dim')}  {tail}")
+	else:
+		print(f"  {paint(f'{total:g} oz', 'bold')} {paint('· no goal set', 'dim')}")
+
+	print()
+	if not entries:
+		note("nothing logged yet today — try: waterTracker.py log 16")
+	for entry in entries:
+		amount = f"{entry['oz']:g}"
+		print(
+			f"  {paint(entry['at'][11:16], 'dim')}"
+			f"  {amount:>6} {paint('oz', 'dim')}"
+			f"  {paint(entry['via'], 'dim')}"
+		)
+
+	streak = tracker.streak()
+	if streak:
+		print(f"\n  {paint(f'🔥 {streak} day streak at goal', 'yellow')}")
+	print()
+
+
+def print_week(tracker: "WaterTracker", days: int) -> None:
+	"""The same recent history as week_lines, drawn for a terminal.
+
+	Scaled to the best day rather than to the goal, so a day that ran past it
+	still reads as bigger than one that only just got there; a tick marks where
+	the goal falls on that scale.
+	"""
+	goal = tracker.goal
+	totals = [
+		(date.today() - timedelta(days=offset), tracker.day_total(date.today() - timedelta(days=offset)))
+		for offset in range(days - 1, -1, -1)
+	]
+	scale = max([goal] + [total for _, total in totals]) or 1
+	width = bar_width(34)
+	# Only worth a tick when a day ran past the goal and pushed the scale out
+	# with it. Otherwise the goal is the right-hand edge of the track and marking
+	# it says nothing.
+	goal_column = int(width * goal / scale) - 1 if goal and scale > goal else -1
+
+	span = "yesterday and today" if days == 2 else ("today" if days == 1 else f"last {days} days")
+	heading(f"💧 {span.capitalize()} · goal {goal:g} oz" if goal else f"💧 {span.capitalize()}")
+	for day, total in totals:
+		full, part = divmod(round(total / scale * width * 8), 8)
+		cells = list("█" * full + (EIGHTHS[part] if part else ""))
+		track = list("░" * (width - len(cells)))
+		# The tick only lands in the empty half; a bar that reached the goal has
+		# already said so by covering it.
+		if 0 <= goal_column - len(cells) < len(track):
+			track[goal_column - len(cells)] = "┊"
+		met = goal and total >= goal
+		bar = paint("".join(cells), "green" if met else "cyan") + paint("".join(track), "dim")
+		label = f"{day:%a %m-%d}"
+		if day == date.today():
+			label = paint(label, "bold")
+		amount = f"{total:g}"
+		row = f"  {label}  {bar} {amount:>5} {paint('oz', 'dim')}"
+		print(f"{row}  {paint('✓', 'green')}" if met else row)
+
+	average = sum(total for _, total in totals) / len(totals)
+	summary = paint(f"{average:.0f} oz/day average", "bold")
+	if goal:
+		met_count = sum(1 for _, total in totals if total >= goal)
+		summary += f"  {paint('·', 'dim')}  {paint(f'{met_count} of {days} days at goal', 'dim')}"
+	print(f"\n  {summary}\n")
+
+
 class WaterTracker:
 	def __init__(self) -> None:
 		# Not required here: status, week and log only touch the state file, and
@@ -1102,7 +1256,7 @@ class WaterTracker:
 		self.require_phone()
 		if not message.startswith(MARKER):
 			message = f"{MARKER} {message}"
-		print(f"-> {message}")
+		print(f"{paint('→', 'cyan')} {message}")
 		# A self-chat shows every message twice — once as sent, once as the
 		# same thing received — so the tracker's half of the conversation
 		# doubles everything in the thread. WATER_PUSH_ONLY keeps it out of
@@ -1872,10 +2026,25 @@ def doctor() -> None:
 	file and launchctl to explain: nothing was running.
 	"""
 
-	def check(good: bool, note: str) -> None:
-		print(f"  {'ok  ' if good else 'FAIL'}  {note}")
+	failures: list[str] = []
 
-	print("Water tracker checkup")
+	def check(good: bool, what: str) -> None:
+		if not good:
+			failures.append(what)
+		if colour_ready():
+			mark = paint("✓", "green") if good else paint("✗", "red")
+			print(f"  {mark}  {what if good else paint(what, 'red')}")
+		else:
+			# The plain shape is the one the tests read, and the one that ends up
+			# in a log or a pasted bug report, so it stays word-for-word.
+			print(f"  {'ok  ' if good else 'FAIL'}  {what}")
+
+	def detail(text: str) -> None:
+		# Indented to sit under a check's text, and the two markers are not the
+		# same width: "  ✓  " against the plain "  ok    ".
+		print(f"{'     ' if colour_ready() else '        '}{paint(text, 'dim')}")
+
+	heading("💧 Water tracker checkup")
 	installed = installed_agent()
 	agent = installed.get("EnvironmentVariables", {})
 	phone = os.getenv("WATER_PHONE")
@@ -1904,13 +2073,13 @@ def doctor() -> None:
 		working, how = llm_check()
 		check(working, f"replies {how}")
 	if agent_mode != "off" and LLM_MODE != "off" and anthropic is None:
-		print("        python3 -m pip install anthropic to have Claude read them")
+		detail("python3 -m pip install anthropic to have Claude read them")
 	agent_push = agent.get("WATER_PUSH_URL") or PUSH_URL
 	if agent_push:
-		print(f"        nudges also pushed to {agent_push}")
+		detail(f"nudges also pushed to {agent_push}")
 	else:
-		print("        no push channel: WATER_PUSH_URL unset, so nudges rely on iMessage alone")
-	print(f"        state file {STATE_PATH.resolve()}")
+		detail("no push channel: WATER_PUSH_URL unset, so nudges rely on iMessage alone")
+	detail(f"state file {STATE_PATH.resolve()}")
 	state = load_state(quarantine=False)
 	if state is None:
 		check(False, "state file is unreadable; 'run' will set it aside and start fresh")
@@ -1977,18 +2146,18 @@ def doctor() -> None:
 			at = datetime.fromisoformat(woke)
 			if at.date() == date.today():
 				start = min(max(at.hour + at.minute / 60, float(WAKE_HOUR)), float(SLEEP_HOUR))
-				print(f"        day started {at:%H:%M} (you texted that you were up)")
+				detail(f"day started {at:%H:%M} (you texted that you were up)")
 		except (TypeError, ValueError):
-			print(f"        woke_at is unreadable ({woke!r}); falling back to {WAKE_HOUR}:00")
+			detail(f"woke_at is unreadable ({woke!r}); falling back to {WAKE_HOUR}:00")
 	else:
-		print(f"        no wake time texted today; pacing from {WAKE_HOUR}:00")
+		detail(f"no wake time texted today; pacing from {WAKE_HOUR}:00")
 	right_now = datetime.now()
 	awake = start <= right_now.hour + right_now.minute / 60 < SLEEP_HOUR
 	if awake:
 		check(True, f"inside the {clock(start)}-{SLEEP_HOUR}:00 nudge window")
 	else:
 		# The time of day is not a fault, so it reads as a fact, not a failure.
-		print(f"        outside the {WAKE_HOUR}:00-{SLEEP_HOUR}:00 nudge window")
+		detail(f"outside the {WAKE_HOUR}:00-{SLEEP_HOUR}:00 nudge window")
 
 	# Only a gap the tracker cannot explain is worth reporting. Overnight, or
 	# once the goal is met, silence is the design and flagging it is noise.
@@ -2015,9 +2184,9 @@ def doctor() -> None:
 	# text that arrived off the interval, or one that never came.
 	waiting = state.get("awaiting_reply_since")
 	if not FOLLOWUP_MIN:
-		print("        no follow-ups: WATER_FOLLOWUP_MIN=0")
+		detail("no follow-ups: WATER_FOLLOWUP_MIN=0")
 	elif not waiting:
-		print(f"        nothing awaiting a reply; follow-up after {FOLLOWUP_MIN} min of silence")
+		detail(f"nothing awaiting a reply; follow-up after {FOLLOWUP_MIN} min of silence")
 	else:
 		held = (time.time() - float(waiting)) / 60
 		if state.get("followed_up"):
@@ -2031,9 +2200,24 @@ def doctor() -> None:
 			why = " (due now)"
 		else:
 			why = f" (in {FOLLOWUP_MIN - held:.0f} min)"
-		print(f"        nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{why}")
-	print(f"        today {total:g}/{goal:g} oz")
-	print("Send a text with 'test' to confirm the Messages Automation prompt was approved.")
+		detail(f"nudge unanswered for {held:.0f} min, follow-up at {FOLLOWUP_MIN} min{why}")
+	if goal:
+		detail(f"today {total:g}/{goal:g} oz {meter(total / goal, bar_width(40, longest=20))}")
+	else:
+		detail(f"today {total:g} oz, no goal set")
+
+	# The list above is long enough that a clean run is easy to misread as a
+	# problem. Say which it was.
+	print()
+	if failures:
+		print(f"  {paint(f'{len(failures)} problem(s) to fix:', 'bold', 'red')}")
+		for failure in failures:
+			print(f"    {paint('•', 'red')} {failure}")
+	else:
+		clean = "✓ everything checks out" if colour_ready() else "everything checks out"
+		print(f"  {paint(clean, 'bold', 'green')}")
+	note("send a text with 'test' to confirm the Messages Automation prompt was approved.")
+	print()
 
 
 def main(argv: list[str]) -> None:
@@ -2048,16 +2232,10 @@ def main(argv: list[str]) -> None:
 	tracker = WaterTracker()
 
 	if command == "status":
-		print(f"Today: {tracker.progress_line()}")
-		for entry in tracker.entries():
-			print(f"  {entry['at'][11:16]}  {entry['oz']:>5g} oz  ({entry['via']})")
-		streak = tracker.streak()
-		if streak:
-			print(f"Streak: {streak} day(s) at goal.")
+		print_status(tracker)
 	elif command == "week":
 		days = int(argv[1]) if len(argv) > 1 else 7
-		print(f"Last {days} days against a {tracker.goal:g} oz goal:")
-		print("\n".join(tracker.week_lines(days)))
+		print_week(tracker, days)
 	elif command == "log":
 		if len(argv) < 2:
 			raise SystemExit("Usage: python waterTracker.py log 16")
@@ -2065,7 +2243,8 @@ def main(argv: list[str]) -> None:
 		if ounces is None:
 			raise SystemExit("Could not read that amount, try '16' or '2 cups'.")
 		tracker.add(ounces, "cli")
-		print(f"Logged {ounces:g} oz. {tracker.progress_line()}")
+		print(f"{paint('✓', 'green')} logged {paint(f'{ounces:g} oz', 'bold')}")
+		print_status(tracker)
 	elif command == "test":
 		# push=True on purpose: this command exists to prove delivery, and the
 		# push is now the half that actually notifies.
@@ -2073,9 +2252,9 @@ def main(argv: list[str]) -> None:
 			f"\U0001f4a7 Water tracker is connected. {tracker.progress_line()}", push=True
 		)
 		if PUSH_URL:
-			print(f"Also pushed to {PUSH_URL}")
+			note(f"also pushed to {PUSH_URL}")
 		else:
-			print("No WATER_PUSH_URL set, so nothing was pushed.")
+			note("no WATER_PUSH_URL set, so nothing was pushed")
 	elif command == "run":
 		tracker.run()
 	else:

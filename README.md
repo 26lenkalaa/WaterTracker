@@ -90,6 +90,47 @@ python3 waterTracker.py install    # write the LaunchAgent
 
 `status`, `week` and `log` don't need `WATER_PHONE` — only sending does.
 
+`status` draws the day, and `log` prints it back after adding to it:
+
+```
+$ python3 waterTracker.py status
+
+💧 Water · Sat Sep 12
+
+  ███████████████▏░░░░░░░░░░░░░░░░  47%
+  60.3 / 128 oz  ·  67.7 oz to go
+
+  01:29    40.3 oz  reply
+  15:25      20 oz  reply
+
+  🔥 3 day streak at goal
+```
+
+`week` scales its bars to the best day rather than to the goal, so a day that
+ran well past it still reads as the bigger one; the `┊` marks where the goal
+falls once some day has pushed the scale out beyond it.
+
+```
+$ python3 waterTracker.py week
+
+💧 Last 7 days · goal 128 oz
+
+  Sun 09-06  ████████████████████████████████   150 oz  ✓
+  Mon 09-07  ███████████████████████████▎░░░░   128 oz  ✓
+  Tue 09-08  █████████▍░░░░░░░░░░░░░░░░┊░░░░░    44 oz
+  Wed 09-09  ████████████████████▌░░░░░┊░░░░░    96 oz
+  Thu 09-10  ░░░░░░░░░░░░░░░░░░░░░░░░░░┊░░░░░     0 oz
+  Fri 09-11  ███████████████████████▌░░┊░░░░░   110 oz
+  Sat 09-12  ████████████▉░░░░░░░░░░░░░┊░░░░░  60.3 oz
+
+  84 oz/day average  ·  2 of 7 days at goal
+```
+
+The bars fill by eighths of a character, so a swallow moves them, and they size
+themselves to the terminal. None of that colour reaches your phone: what
+`status` and `week` *text* back is built separately and stays plain, because an
+escape sequence in an iMessage arrives as gibberish and can't be unsent.
+
 ### Texting it back
 
 Text it however you like. A message that is nothing but an amount is answered
@@ -457,19 +498,27 @@ state that makes silence *correct*, like a met goal or a pause.
 
 ```
 $ python3 waterTracker.py doctor
-Water tracker checkup
-  ok    texting +1555..., from the LaunchAgent
-  ok    replies read by claude-opus-5, with pattern matching as the fallback
-        state file /Users/you/WaterTracker/water_tracker_state.json
-  ok    state file exists
-  ok    this python can read Messages history, so replies are picked up
-  ok    agent log clean since it started
-  ok    LaunchAgent loaded
-  ok    loop running (pid 10538)
-  ok    no nudge due: it is outside 8:00-22:00
-        nothing awaiting a reply; follow-up after 60 min of silence
-        today 0/100 oz
+
+💧 Water tracker checkup
+
+  ✓  texting +1555..., from the LaunchAgent
+  ✓  replies read by claude-opus-5, with pattern matching as the fallback
+     state file /Users/you/WaterTracker/water_tracker_state.json
+  ✓  state file exists
+  ✓  this python can read Messages history, so replies are picked up
+  ✓  agent log clean since it started
+  ✓  LaunchAgent loaded
+  ✓  loop running (pid 10538)
+  ✓  no nudge due: it is outside 8:00-22:00
+     nothing awaiting a reply; follow-up after 60 min of silence
+     today 0/100 oz ░░░░░░░░░░░░░░░░░░░░
+
+  ✓ everything checks out
 ```
+
+The ticks are green and the failures red on a terminal. Piped to a file, into a
+bug report, or with `NO_COLOR` set, the same run prints `ok` and `FAIL` in
+place of the glyphs and no escape sequences at all.
 
 That follow-up line reads as a fact rather than a check, because both states
 are normal. It's what explains a text that arrived off the interval — or one

@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import struct
@@ -1176,6 +1177,124 @@ class WeekTest(TrackerTestCase):
 		self.tracker.handle_reply("what was my weekly average")
 		self.assertIn("oz/day average", self.sent[-1])
 		self.assertEqual(self.tracker.total(), 0, "a question logged an amount")
+
+
+class ColourTest(unittest.TestCase):
+	"""When escapes are allowed out, and what they may never be written into."""
+
+	def setUp(self):
+		self.saved = {name: os.environ.get(name) for name in ("NO_COLOR", "TERM")}
+		os.environ.pop("NO_COLOR", None)
+		os.environ["TERM"] = "xterm-256color"
+		self.addCleanup(self.restore)
+
+	def restore(self):
+		for name, value in self.saved.items():
+			os.environ.pop(name, None) if value is None else os.environ.update({name: value})
+
+	def tty(self, is_tty=True):
+		"""Point sys.stdout at a buffer that claims to be (or not be) a terminal."""
+		buffer = io.StringIO()
+		buffer.isatty = lambda: is_tty
+		return buffer
+
+	def test_a_terminal_gets_colour_and_a_pipe_does_not(self):
+		with redirect_stdout(self.tty(True)):
+			self.assertTrue(wt.colour_ready())
+		with redirect_stdout(self.tty(False)):
+			self.assertFalse(wt.colour_ready(), "wrote escapes into a pipe")
+
+	def test_no_color_and_dumb_terminals_are_honoured(self):
+		# no-color.org: the variable counts when it is set at all, empty included.
+		for name, value in (("NO_COLOR", "1"), ("NO_COLOR", ""), ("TERM", "dumb"), ("TERM", "")):
+			with self.subTest(setting=f"{name}={value!r}"):
+				previous = os.environ.get(name)
+				os.environ[name] = value
+				try:
+					with redirect_stdout(self.tty(True)):
+						self.assertFalse(wt.colour_ready())
+				finally:
+					os.environ.pop(name, None) if previous is None else os.environ.update({name: previous})
+
+	def test_paint_is_a_no_op_without_a_terminal(self):
+		with redirect_stdout(self.tty(False)):
+			self.assertEqual(wt.paint("hello", "red", "bold"), "hello")
+
+	def test_the_meter_clamps_instead_of_overflowing(self):
+		with redirect_stdout(self.tty(False)):
+			self.assertEqual(wt.meter(0, 8), "░" * 8)
+			self.assertEqual(wt.meter(1, 8), "█" * 8)
+			self.assertEqual(wt.meter(4.0, 8), "█" * 8, "a day past the goal ran off the end")
+			self.assertEqual(wt.meter(-1, 8), "░" * 8, "a negative fraction drew backwards")
+			self.assertEqual(len(wt.meter(0.5, 8)), 8)
+
+
+class MessageSafetyTest(TrackerTestCase):
+	"""Nothing bound for iMessage may carry a terminal escape.
+
+	progress_line and week_lines are what 'status' and 'week' text back. An
+	escape sequence in one of those arrives on a phone as literal gibberish and
+	cannot be unsent, so they stay plain even with colour fully on.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "colour_ready", lambda: True)
+
+	def test_the_texted_progress_line_and_week_are_plain(self):
+		self.set_day(date.today() - timedelta(days=1), 64)
+		self.tracker.add(32, "test")
+		for text in [self.tracker.progress_line(), *self.tracker.week_lines(7)]:
+			with self.subTest(text=text):
+				self.assertNotIn("\033", text)
+
+	def test_every_message_the_tracker_sends_is_plain(self):
+		for reply in ("status", "week", "16 oz", "goal 120", "undo", "pause", "resume"):
+			with self.subTest(reply=reply):
+				self.tracker.handle_reply(reply)
+				self.assertNotIn("\033", self.sent[-1])
+
+
+class TerminalOutputTest(TrackerTestCase):
+	"""The printed views: readable with colour off, and not crashing with it on."""
+
+	def render(self, command, colour):
+		self.patch(wt, "colour_ready", lambda: colour)
+		self.tracker.add(32, "cli")
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.main(command)
+		return printed.getvalue()
+
+	def test_status_shows_the_total_goal_and_entries(self):
+		output = self.render(["status"], colour=False)
+		self.assertNotIn("\033", output)
+		self.assertIn("32 / 100 oz", output)
+		self.assertIn("68 oz to go", output)
+		self.assertIn("32", output)
+		self.assertIn("cli", output, "the entry's source is missing")
+
+	def test_status_says_so_when_the_goal_is_met(self):
+		self.tracker.add(100, "cli")
+		output = self.render(["status"], colour=False)
+		self.assertIn("goal met", output)
+		self.assertIn("32 oz past it", output)
+
+	def test_week_shows_a_row_per_day_and_the_average(self):
+		output = self.render(["week", "3"], colour=False)
+		self.assertNotIn("\033", output)
+		rows = [line for line in output.splitlines() if re.search(r"\d\d-\d\d", line)]
+		self.assertEqual(len(rows), 3, "not one row per day")
+		self.assertIn("0 of 3 days at goal", output)
+
+	def test_colour_only_ever_adds_escapes(self):
+		# The same view twice: stripping the escapes from the painted one has to
+		# give back the plain one, or colour is changing the content.
+		plain = self.render(["status"], colour=False)
+		self.setUp()
+		painted = self.render(["status"], colour=True)
+		self.assertIn("\033", painted, "colour was on but nothing was painted")
+		self.assertEqual(re.sub(r"\033\[[0-9;]*m", "", painted), plain)
 
 
 class NormalisePhotoTest(unittest.TestCase):
