@@ -1143,6 +1143,14 @@ class StreakTest(TrackerTestCase):
 		self.set_day(today - timedelta(days=3), 100)
 		self.assertEqual(self.tracker.streak(), 1)
 
+	def test_a_goal_of_zero_has_no_streak_to_count(self):
+		# Every day clears a goal of zero, so the walk backwards never finds a
+		# day to stop on: this used to count past the first century AD and die
+		# of OverflowError, taking 'status' with it.
+		self.tracker.state["goal_oz"] = 0
+		self.tracker.add(16, "test")
+		self.assertEqual(self.tracker.streak(), 0)
+
 
 class WeekTest(TrackerTestCase):
 	def test_lists_recent_days_oldest_first_with_an_average(self):

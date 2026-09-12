@@ -1068,7 +1068,13 @@ class WaterTracker:
 		return lines
 
 	def streak(self) -> int:
-		"""Consecutive days up to yesterday that met the goal, plus today if met."""
+		"""Consecutive days up to yesterday that met the goal, plus today if met.
+
+		No goal, no streak. Without this the walk never finds a day under the
+		goal to stop at, and counts backwards out of the range of date itself.
+		"""
+		if not self.goal:
+			return 0
 		count = 0
 		day = date.today()
 		if self.total() < self.goal:
