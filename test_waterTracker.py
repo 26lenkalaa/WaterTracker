@@ -1266,6 +1266,15 @@ class ColourTest(unittest.TestCase):
 		with redirect_stdout(self.tty(False)):
 			self.assertEqual(wt.paint("hello", "red", "bold"), "hello")
 
+	def test_the_pace_tick_shows_only_while_it_is_still_ahead(self):
+		with redirect_stdout(self.tty(False)):
+			self.assertIn("┊", wt.meter(0.3, 24, pace=0.5), "no tick for a pace not yet reached")
+			self.assertNotIn("┊", wt.meter(0.9, 24, pace=0.3), "ticked a pace already passed")
+			self.assertNotIn("┊", wt.meter(0.3, 24), "a tick with no pace given")
+			# A full day's pace belongs on the last cell, not off the end.
+			self.assertTrue(wt.meter(0.0, 24, pace=1.0).endswith("┊"))
+			self.assertEqual(len(wt.meter(0.3, 24, pace=0.5)), 24, "the tick changed the width")
+
 	def test_the_meter_clamps_instead_of_overflowing(self):
 		with redirect_stdout(self.tty(False)):
 			self.assertEqual(wt.meter(0, 8), "░" * 8)
@@ -1325,6 +1334,21 @@ class TerminalOutputTest(TrackerTestCase):
 		output = self.render(["status"], colour=False)
 		self.assertIn("goal met", output)
 		self.assertIn("32 oz past it", output)
+
+	def test_status_says_whether_you_are_keeping_pace(self):
+		# Half the goal at noon and half of it at ten at night are not the same
+		# day, which is the whole reason the percentage alone is not enough.
+		for expected, wording in ((0.0, "ahead of an even pace"), (100.0, "behind an even pace")):
+			with self.subTest(expected=expected):
+				self.setUp()
+				self.patch(wt.WaterTracker, "expected_by_now", lambda self, now=None: expected)
+				self.assertIn(wording, self.render(["status"], colour=False))
+
+	def test_a_met_goal_drops_the_pace_line(self):
+		# Nothing to chase once it is done, so the line would only be noise.
+		self.patch(wt.WaterTracker, "expected_by_now", lambda self, now=None: 100.0)
+		self.tracker.add(100, "cli")
+		self.assertNotIn("pace", self.render(["status"], colour=False))
 
 	def test_week_shows_a_row_per_day_and_the_average(self):
 		output = self.render(["week", "3"], colour=False)
