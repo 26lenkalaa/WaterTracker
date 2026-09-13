@@ -5,10 +5,10 @@ runs on your Mac, talks to Messages, and keeps no account and no server — your
 intake log is a JSON file on your own disk.
 
 ```
-You  22:14   💧 Water break. ███░░░░░░░ 32/100 oz (32%) 28 oz behind pace.
-              Reply with an amount to log it.
+You  22:14   💧 Water break. 32/100 oz ███░░░░░░░ 32% 28 oz behind pace.
+              How much?
 Me   22:16   just had a couple glasses
-You  22:16   💧 Logged 16 oz. ████░░░░░░ 48/100 oz (48%) — 52 oz to go.
+You  22:16   💧 Logged 16 oz. 48/100 oz ████░░░░░░ 48% — 52 oz to go.
 ```
 
 Replies are read as sentences, so `drank 500ml and a bottle at the gym` and
@@ -161,6 +161,36 @@ The bars fill by eighths of a character, so a swallow moves them, and they size
 themselves to the terminal. None of that colour reaches your phone: what
 `status` and `week` *text* back is built separately and stays plain, because an
 escape sequence in an iMessage arrives as gibberish and can't be unsent.
+
+### What the phone gets instead
+
+The texted views are written for a different medium, not a downgrade of these
+ones. iMessage sets text in a **proportional** font, so a padded column only
+looks aligned in the editor you wrote it in. The week used to right-align its
+ounces and space its gaps for a monospace terminal it was never displayed in:
+
+```
+  Mon 09-07  ██████████   150 oz *      <- built for a font iMessage doesn't use
+```
+
+Block glyphs are the one thing on the line with a predictable width, so the
+bars do the aligning and the ragged numbers sit at the end where it doesn't
+show. The summary leads, because on a phone it's the answer:
+
+```
+💧 7 days · 84 oz/day average · 3 at goal
+Mon ██████████ 150 ✅
+Tue ██████████ 128 ✅
+Wed ████░░░░░░ 44
+Thu █████████░ 96
+Fri ░░░░░░░░░░ 0
+Sat ██████████ 110 ✅
+Sun ██████░░░░ 60.3
+```
+
+A test asserts the rule rather than the appearance: no texted line may contain
+a double space or leading padding. The 💧 stays first on every message — it's
+how the tracker recognises its own echo in a self-chat, not decoration.
 
 ### Texting it back
 

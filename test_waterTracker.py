@@ -948,7 +948,7 @@ class FollowPlanTest(TrackerTestCase):
 
 	def test_each_action_reaches_its_handler(self):
 		for action, expected in (
-			("status", "Today:"),
+			("status", "/100 oz"),
 			("week", "oz/day average"),
 			("pause", "Paused"),
 			("resume", "Reminders back on"),
@@ -1159,19 +1159,30 @@ class WeekTest(TrackerTestCase):
 		today = date.today()
 		self.set_day(today - timedelta(days=1), 100)
 		self.set_day(today - timedelta(days=2), 50)
-		lines = self.tracker.week_lines(3)
+		summary, *days = self.tracker.week_lines(3)
 
-		self.assertEqual(len(lines), 4, "3 days plus a summary")
-		self.assertIn("50 oz", lines[0])
-		self.assertIn("100 oz", lines[1])
-		self.assertIn("*", lines[1], "a day at goal is marked")
-		self.assertNotIn("*", lines[0])
-		self.assertIn("50 oz/day average, 1/3 days at goal", lines[-1])
+		self.assertEqual(len(days), 3, "a summary plus 3 days")
+		self.assertIn("50", days[0])
+		self.assertIn("100", days[1])
+		self.assertIn("✅", days[1], "a day at goal is marked")
+		self.assertNotIn("✅", days[0])
+		self.assertIn("50 oz/day average", summary)
+		self.assertIn("1 at goal", summary)
 
 	def test_days_with_nothing_logged_count_as_zero(self):
-		lines = self.tracker.week_lines(7)
-		self.assertIn("0 oz/day average, 0/7 days at goal", lines[-1])
-		self.assertEqual(len(lines), 8)
+		summary, *days = self.tracker.week_lines(7)
+		self.assertIn("0 oz/day average", summary)
+		self.assertIn("0 at goal", summary)
+		self.assertEqual(len(days), 7)
+
+	def test_no_line_pads_a_column_for_a_font_it_never_gets(self):
+		# iMessage sets a proportional font, so padded columns only look
+		# aligned here. The bars are the one fixed-width thing on the line.
+		self.set_day(date.today() - timedelta(days=1), 100)
+		for line in self.tracker.week_lines(3):
+			with self.subTest(line=line):
+				self.assertNotIn("  ", line, "padded a column that cannot line up on a phone")
+				self.assertEqual(line, line.strip(), "leading or trailing padding")
 
 	def test_asking_by_text_answers_with_the_week(self):
 		self.set_day(date.today() - timedelta(days=1), 64)
@@ -2089,7 +2100,7 @@ class FollowUpTest(TrackerTestCase):
 		self.waited(wt.FOLLOWUP_MIN)
 		self.tracker.maybe_remind()
 		self.assertEqual(len(self.chases()), 1)
-		self.assertIn("Reply with an amount", self.sent[-1])
+		self.assertIn("How much?", self.sent[-1])
 
 	def test_stays_quiet_until_the_hour_is_up(self):
 		self.tracker.maybe_remind()

@@ -1279,18 +1279,26 @@ class WaterTracker:
 		return "█" * filled + "░" * (10 - filled)
 
 	def week_lines(self, days: int = 7) -> list[str]:
-		"""One line per recent day, oldest first, against today's goal."""
-		lines, totals = [], []
+		"""The texted week: the summary, then one line per day, oldest first.
+
+		This goes to a phone, and iMessage sets text in a proportional font, so
+		nothing here pads a column -- the old version right-aligned the ounces
+		and spaced the gaps for a monospace terminal it was never shown in. The
+		block glyphs are the one fixed-width thing on the line, which leaves the
+		bars doing the aligning and the ragged numbers at the end where it does
+		not show. The summary leads because it is the answer.
+		"""
+		rows, totals = [], []
 		for offset in range(days - 1, -1, -1):
 			day = date.today() - timedelta(days=offset)
 			total = self.day_total(day)
 			totals.append(total)
-			met = "*" if self.goal and total >= self.goal else " "
-			lines.append(f"  {day.strftime('%a %m-%d')}  {self.bar(total)} {total:>5g} oz {met}")
+			met = " ✅" if self.goal and total >= self.goal else ""
+			rows.append(f"{day:%a} {self.bar(total)} {total:g}{met}")
 		met_count = sum(1 for total in totals if self.goal and total >= self.goal)
 		average = sum(totals) / len(totals)
-		lines.append(f"  {average:.0f} oz/day average, {met_count}/{days} days at goal")
-		return lines
+		summary = f"{days} days · {average:.0f} oz/day average · {met_count} at goal"
+		return [summary] + rows
 
 	def streak(self) -> int:
 		"""Consecutive days up to yesterday that met the goal, plus today if met.
@@ -1393,10 +1401,15 @@ class WaterTracker:
 		return False
 
 	def progress_line(self) -> str:
+		"""Today, for a phone: the numbers first, the bar as the picture of them.
+
+		Read on a lock screen more often than anywhere else, so the figure that
+		answers the question leads and the bar trails as illustration.
+		"""
 		total, goal = self.total(), self.goal
 		if not goal:
 			return f"{total:g} oz"
-		return f"{self.bar(total)} {total:g}/{goal:g} oz ({total / goal * 100:.0f}%)"
+		return f"{total:g}/{goal:g} oz {self.bar(total)} {total / goal * 100:.0f}%"
 
 	# ----- reply reading -----
 
@@ -1650,9 +1663,9 @@ class WaterTracker:
 		elif action == "goal":
 			self.send(self.set_goal(plan["goal_oz"]))
 		elif action == "status":
-			self.send(f"\U0001f4a7 Today: {self.progress_line()}")
+			self.send(self.progress_line())
 		elif action == "week":
-			self.send("Last 7 days:\n" + "\n".join(line.strip() for line in self.week_lines()))
+			self.send("\n".join(self.week_lines()))
 		elif action == "undo":
 			self.send(self.undo())
 		elif action == "pause":
@@ -1723,10 +1736,10 @@ class WaterTracker:
 			return
 
 		if intent == "status":
-			self.send(f"\U0001f4a7 Today: {self.progress_line()}")
+			self.send(self.progress_line())
 			return
 		if intent == "week":
-			self.send("Last 7 days:\n" + "\n".join(line.strip() for line in self.week_lines()))
+			self.send("\n".join(self.week_lines()))
 			return
 		if intent == "pause":
 			self.send(self.pause())
@@ -1848,7 +1861,7 @@ class WaterTracker:
 		# the command line, without a reply.
 		self.send(
 			f"\U0001f4a7 Still {self.progress_line()} — no reply since I asked "
-			f"{waiting:.0f} min ago.\nReply with an amount to log it, or 'not yet'.",
+			f"{waiting:.0f} min ago.\nHow much? Or 'not yet'.",
 			push=True,
 		)
 
@@ -1892,7 +1905,7 @@ class WaterTracker:
 		deficit = self.expected_by_now() - self.total()
 		behind = f" {deficit:.0f} oz behind pace." if deficit >= 1 else ""
 		self.send(
-			f"\U0001f4a7 {nudge} {self.progress_line()}{behind}\nReply with an amount to log it.",
+			f"\U0001f4a7 {nudge} {self.progress_line()}{behind}\nHow much?",
 			push=True,
 		)
 
