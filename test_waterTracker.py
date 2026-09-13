@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1177,6 +1178,51 @@ class WeekTest(TrackerTestCase):
 		self.tracker.handle_reply("what was my weekly average")
 		self.assertIn("oz/day average", self.sent[-1])
 		self.assertEqual(self.tracker.total(), 0, "a question logged an amount")
+
+
+class LazyImportTest(unittest.TestCase):
+	"""The SDK is ~260ms to import and the read-only commands never use it."""
+
+	def run_command(self, *argv):
+		"""Run one command in a fresh interpreter, reporting what it imported."""
+		script = (
+			"import sys, os, importlib.util;"
+			"spec = importlib.util.spec_from_file_location('wt', sys.argv[1]);"
+			"m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m);"
+			"m.STATE_PATH = __import__('pathlib').Path(sys.argv[2]);"
+			"m.main(sys.argv[3:]);"
+			"sys.stderr.write('anthropic' in sys.modules and 'LOADED' or 'ABSENT')"
+		)
+		state = Path(tempfile.mkdtemp()) / "state.json"
+		done = subprocess.run(
+			[sys.executable, "-c", script, str(Path(wt.__file__).resolve()), str(state), *argv],
+			capture_output=True, text=True,
+			env={**os.environ, "WATER_PHONE": "+15551234567", "WATER_LLM": "auto"},
+		)
+		self.assertEqual(done.returncode, 0, done.stderr)
+		return done.stderr
+
+	def test_the_read_only_commands_never_import_the_sdk(self):
+		for argv in (["status"], ["week", "7"], ["log", "16"]):
+			with self.subTest(argv=argv):
+				self.assertEqual(self.run_command(*argv), "ABSENT", f"{argv} paid for the SDK import")
+
+	def test_the_sentinel_never_overwrites_a_stand_in(self):
+		# The tests swap wt.anthropic for a fake module; the loader has to leave
+		# that alone, or every LLM test would silently run against the real SDK.
+		previous = wt.anthropic
+		self.addCleanup(setattr, wt, "anthropic", previous)
+		for stand_in in (SimpleNamespace(name="fake"), None):
+			wt.anthropic = stand_in
+			self.assertIs(wt.load_anthropic(), stand_in)
+
+	def test_loading_is_attempted_once_and_remembered(self):
+		previous = wt.anthropic
+		self.addCleanup(setattr, wt, "anthropic", previous)
+		wt.anthropic = wt._UNLOADED
+		first = wt.load_anthropic()
+		self.assertIsNot(first, wt._UNLOADED, "the sentinel escaped to a caller")
+		self.assertIs(wt.load_anthropic(), first)
 
 
 class ColourTest(unittest.TestCase):

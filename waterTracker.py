@@ -127,10 +127,30 @@ LLM_EFFORT = os.getenv("WATER_EFFORT", "").strip().lower()
 # no tracker: it would be confidently wrong about the one thing being counted.
 MAX_CHAT_CHARS = 300
 
-try:
-	import anthropic
-except ModuleNotFoundError:  # pip install anthropic to turn interpretation on
-	anthropic = None
+# The SDK costs ~260ms to import, which was most of what 'status', 'week' and
+# 'log' spent running at all -- and none of them interpret a reply. So it loads
+# on first use instead of at startup. The name stays a module global, because
+# the `except anthropic.X` handlers below resolve it when an exception is
+# raised, and every path that can reach one calls llm_ready() or llm_check()
+# first.
+_UNLOADED = object()
+anthropic = _UNLOADED
+
+
+def load_anthropic():
+	"""Import the SDK on first use. None when it is not installed.
+
+	Assigning waterTracker.anthropic directly still wins: the sentinel is what
+	marks it unloaded, so a stand-in put there is never overwritten by this.
+	"""
+	global anthropic
+	if anthropic is _UNLOADED:
+		try:
+			import anthropic as sdk
+		except ModuleNotFoundError:  # pip install anthropic to turn interpretation on
+			sdk = None
+		anthropic = sdk
+	return anthropic
 
 # How long a message we sent stays recognisable as our own self-chat echo.
 # Comfortably more than a poll, or the echo would arrive after its record had
@@ -594,7 +614,7 @@ _llm_broken = False
 
 def llm_ready() -> bool:
 	"""Whether interpretation should be attempted at all."""
-	return LLM_MODE != "off" and anthropic is not None and not _llm_broken
+	return LLM_MODE != "off" and load_anthropic() is not None and not _llm_broken
 
 
 def llm_client(quiet: bool = False):
@@ -607,8 +627,11 @@ def llm_client(quiet: bool = False):
 	"""
 	global _llm_client, _llm_broken
 	if _llm_client is None:
+		sdk = load_anthropic()
+		if sdk is None:
+			return None
 		try:
-			_llm_client = anthropic.Anthropic(max_retries=1)
+			_llm_client = sdk.Anthropic(max_retries=1)
 		except Exception as error:
 			if not quiet:
 				print(f"   Claude interpretation off ({error}); using pattern matching")
@@ -628,7 +651,7 @@ def llm_check() -> tuple[bool, str]:
 	"""
 	if LLM_MODE == "off":
 		return True, "pattern matching only (WATER_LLM=off)"
-	if anthropic is None:
+	if load_anthropic() is None:
 		return False, "pattern matching: the anthropic package is not installed"
 	client = llm_client(quiet=True)
 	if client is None:
@@ -2074,7 +2097,7 @@ def doctor() -> None:
 	else:
 		working, how = llm_check()
 		check(working, f"replies {how}")
-	if agent_mode != "off" and LLM_MODE != "off" and anthropic is None:
+	if agent_mode != "off" and LLM_MODE != "off" and load_anthropic() is None:
 		detail("python3 -m pip install anthropic to have Claude read them")
 	agent_push = agent.get("WATER_PUSH_URL") or PUSH_URL
 	if agent_push:
