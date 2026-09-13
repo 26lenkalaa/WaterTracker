@@ -1180,6 +1180,30 @@ class WeekTest(TrackerTestCase):
 		self.assertEqual(self.tracker.total(), 0, "a question logged an amount")
 
 
+class AgoTest(unittest.TestCase):
+	def test_picks_the_roughest_useful_unit(self):
+		now = datetime.now()
+		cases = {
+			0: "just now",
+			5: "5m ago",
+			59: "59m ago",
+			60: "1h ago",
+			125: "2h 5m ago",
+			1440: "24h ago",
+		}
+		for minutes, expected in cases.items():
+			with self.subTest(minutes=minutes):
+				stamp = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+				self.assertEqual(wt.ago(stamp), expected)
+
+	def test_an_unreadable_stamp_decorates_nothing(self):
+		# It only ever adorns a line that is already printed, so a bad entry in
+		# the log must not take the whole listing down with it.
+		for bad in ("", "not-a-date", None, "2026-13-45T99:99:99"):
+			with self.subTest(stamp=bad):
+				self.assertEqual(wt.ago(bad), "")
+
+
 class LazyImportTest(unittest.TestCase):
 	"""The SDK is ~260ms to import and the read-only commands never use it."""
 
@@ -1356,6 +1380,18 @@ class TerminalOutputTest(TrackerTestCase):
 		rows = [line for line in output.splitlines() if re.search(r"\d\d-\d\d", line)]
 		self.assertEqual(len(rows), 3, "not one row per day")
 		self.assertIn("0 of 3 days at goal", output)
+		self.assertIn("32 oz in total", output)
+
+	def test_only_the_newest_entry_is_dated(self):
+		# "2h ago" on the latest one answers whether to drink now; on the rest
+		# it is clutter that every line repeats.
+		self.tracker.add(8, "reply")
+		output = self.render(["status"], colour=False)
+		entries = [line for line in output.splitlines() if re.match(r"\s+\d\d:\d\d\s", line)]
+		self.assertEqual(len(entries), 2, "expected two logged entries")
+		dated = [line for line in entries if "·" in line]
+		self.assertEqual(len(dated), 1, "dated more than the newest entry")
+		self.assertIs(dated[0], entries[-1], "dated something other than the newest")
 
 	def assert_styles_do_not_nest(self, text):
 		"""Every painted run opens, prints, and resets -- without another inside it.

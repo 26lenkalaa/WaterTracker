@@ -1063,6 +1063,24 @@ def bar_width(reserved: int, longest: int = 32) -> int:
 	return max(10, min(longest, columns - reserved))
 
 
+def ago(stamp: str) -> str:
+	"""How long since an entry's timestamp, in the roughest useful unit.
+
+	Empty when the timestamp cannot be read: this decorates a line that is
+	already printed, and a malformed one in the log is not worth failing over.
+	"""
+	try:
+		minutes = (datetime.now() - datetime.fromisoformat(stamp)).total_seconds() / 60
+	except (TypeError, ValueError):
+		return ""
+	if minutes < 1:
+		return "just now"
+	if minutes < 60:
+		return f"{minutes:.0f}m ago"
+	hours, rest = divmod(int(minutes), 60)
+	return f"{hours}h ago" if not rest else f"{hours}h {rest}m ago"
+
+
 def heading(text: str) -> None:
 	print(f"\n{paint(text, 'bold', 'cyan')}\n")
 
@@ -1106,13 +1124,20 @@ def print_status(tracker: "WaterTracker") -> None:
 	print()
 	if not entries:
 		note("nothing logged yet today — try: waterTracker.py log 16")
-	for entry in entries:
+	for index, entry in enumerate(entries):
 		amount = f"{entry['oz']:g}"
-		print(
+		# Only the most recent one is worth dating: it answers "should I be
+		# drinking now", which the rest of the list cannot. The source is padded
+		# before it is painted, or the escapes would count toward the column.
+		newest = index == len(entries) - 1
+		since = ago(entry["at"]) if newest else ""
+		source = f"{entry['via']:<10}" if since else entry["via"]
+		line = (
 			f"  {paint(entry['at'][11:16], 'dim')}"
 			f"  {amount:>6} {paint('oz', 'dim')}"
-			f"  {paint(entry['via'], 'dim')}"
+			f"  {paint(source, 'dim')}"
 		)
+		print(f"{line} {paint('· ' + since, 'dim')}" if since else line)
 
 	streak = tracker.streak()
 	if streak:
@@ -1158,8 +1183,9 @@ def print_week(tracker: "WaterTracker", days: int) -> None:
 		row = f"  {label}  {bar} {amount:>5} {paint('oz', 'dim')}"
 		print(f"{row}  {paint('✓', 'green')}" if met else row)
 
-	average = sum(total for _, total in totals) / len(totals)
-	summary = paint(f"{average:.0f} oz/day average", "bold")
+	drunk = sum(total for _, total in totals)
+	summary = paint(f"{drunk / len(totals):.0f} oz/day average", "bold")
+	summary += f"  {paint('·', 'dim')}  {paint(f'{drunk:g} oz in total', 'dim')}"
 	if goal:
 		met_count = sum(1 for _, total in totals if total >= goal)
 		summary += f"  {paint('·', 'dim')}  {paint(f'{met_count} of {days} days at goal', 'dim')}"
