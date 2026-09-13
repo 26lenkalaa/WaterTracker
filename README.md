@@ -88,7 +88,9 @@ python3 waterTracker.py doctor     # explain why reminders are not arriving
 python3 waterTracker.py install    # write the LaunchAgent
 ```
 
-`status`, `week` and `log` don't need `WATER_PHONE` — only sending does.
+`status`, `week` and `log` don't need `WATER_PHONE` — only sending does, and
+none of them import the Anthropic SDK. That import alone was 258 ms of the
+317 ms `status` used to take; it now loads on first use, and these run in 37 ms.
 
 `status` draws the day — the bar, what's left, and where each entry came from:
 
@@ -99,14 +101,23 @@ $ python3 waterTracker.py status
 
   ███████████████▏░░░░░░░░░░░░░░░░  47%
   60.3 / 128 oz  ·  67.7 oz to go
+  △ 2 oz ahead of an even pace for this hour
 
-  01:29    40.3 oz  reply
-  15:25      20 oz  reply
+  08:05      20 oz  reply
+  11:40      24 oz  photo
+  13:20    16.3 oz  reply      · 45m ago
 ```
 
+47% means one thing at noon and another at ten at night, so the third line says
+where you are against an **even pace for the hour** — the same number the loop
+uses to space its nudges. A `┊` tick appears in the empty track at the point
+that pace would have you by now, and disappears once the bar passes it. Only
+the newest entry is dated, because that's the one that answers whether to drink
+something now.
+
 Once the goal is met the bar turns green and the second line says by how much —
-`goal met, 24 oz past it` — and a run of days at goal adds a
-`🔥 4 day streak at goal` line under the entries.
+`goal met, 24 oz past it` — the pace line drops, since there's nothing left to
+chase, and a run of days at goal adds a `🔥 4 day streak at goal` line.
 
 `log` adds an amount without texting anything, then prints the same view back:
 
@@ -118,10 +129,12 @@ $ python3 waterTracker.py log 16
 
   ███████████████████▏░░░░░░░░░░░░  60%
   76.3 / 128 oz  ·  51.7 oz to go
+  △ 18 oz ahead of an even pace for this hour
 
-  01:29    40.3 oz  reply
-  15:25      20 oz  reply
-  18:43      16 oz  cli
+  08:05      20 oz  reply
+  11:40      24 oz  photo
+  13:20    16.3 oz  reply
+  14:05      16 oz  cli        · just now
 ```
 
 `week` scales its bars to the best day rather than to the goal, so a day that
@@ -141,7 +154,7 @@ $ python3 waterTracker.py week
   Fri 09-11  ███████████████████████▌░░┊░░░░░   110 oz
   Sat 09-12  ████████████▉░░░░░░░░░░░░░┊░░░░░  60.3 oz
 
-  84 oz/day average  ·  2 of 7 days at goal
+  84 oz/day average  ·  588.3 oz in total  ·  2 of 7 days at goal
 ```
 
 The bars fill by eighths of a character, so a swallow moves them, and they size
@@ -462,7 +475,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 192 tests, ~0.4s
+python3 -m unittest discover .        # 201 tests, ~0.4s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
