@@ -77,7 +77,6 @@ import time
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 GOAL_OZ = float(os.getenv("WATER_GOAL_OZ", "100"))
 INTERVAL_MIN = int(os.getenv("WATER_INTERVAL_MIN", "120"))
@@ -1925,6 +1924,11 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 
 def install_agent() -> None:
 	"""Write a LaunchAgent, so reminders do not stop with the terminal."""
+	# Imported here, not at the top: it is only needed to build the plist
+	# below, and it pulls urllib.request in behind it -- 12ms that every
+	# status, week and log run would otherwise pay for and never use.
+	from xml.sax.saxutils import escape
+
 	phone = os.getenv("WATER_PHONE")
 	if not phone:
 		raise SystemExit('Missing WATER_PHONE, e.g. export WATER_PHONE="+15551234567"')
