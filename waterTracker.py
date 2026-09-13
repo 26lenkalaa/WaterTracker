@@ -1038,13 +1038,23 @@ def paint(text: str, *styles: str) -> str:
 EIGHTHS = " ▏▎▍▌▋▊▉█"
 
 
-def meter(fraction: float, width: int) -> str:
-	"""A painted bar, clamped to full, filled to the nearest eighth of a cell."""
+def meter(fraction: float, width: int, pace: float | None = None) -> str:
+	"""A painted bar, clamped to full, filled to the nearest eighth of a cell.
+
+	A pace fraction puts a tick in the empty track at the point you would have
+	reached by now drinking evenly. Once the bar has passed it there is nothing
+	to say, so the tick only shows while it is still ahead of you.
+	"""
 	fraction = max(0.0, min(1.0, fraction))
 	full, part = divmod(round(fraction * width * 8), 8)
 	bar = "█" * full + (EIGHTHS[part] if part else "")
+	track = ["░"] * (width - len(bar))
+	if pace is not None:
+		column = min(width - 1, int(width * max(0.0, min(1.0, pace)))) - len(bar)
+		if 0 <= column < len(track):
+			track[column] = "┊"
 	tone = "green" if fraction >= 1 else "cyan"
-	return paint(bar, tone) + paint("░" * (width - len(bar)), "dim")
+	return paint(bar, tone) + paint("".join(track), "dim")
 
 
 def bar_width(reserved: int, longest: int = 32) -> int:
@@ -1070,13 +1080,26 @@ def print_status(tracker: "WaterTracker") -> None:
 		fraction = total / goal
 		percent = f"{fraction * 100:.0f}%".rjust(4)
 		tone = "green" if fraction >= 1 else "bold"
-		print(f"  {meter(fraction, bar_width(14))} {paint(percent, tone)}")
+		width = bar_width(14)
+		print(f"  {meter(fraction, width, pace=tracker.expected_by_now() / goal)} {paint(percent, tone)}")
 		remaining = goal - total
 		if remaining > 0:
 			tail = paint(f"{remaining:g} oz to go", "dim")
 		else:
 			tail = paint(f"goal met{f', {-remaining:g} oz past it' if remaining else ''}", "green")
 		print(f"  {paint(f'{total:g} / {goal:g} oz', 'bold')}  {paint('·', 'dim')}  {tail}")
+
+		# The nudges already pace themselves against this number; saying it out
+		# loud is what turns "47%" into something you can act on, because half
+		# the goal at noon and half of it at ten at night are not the same day.
+		drift = total - tracker.expected_by_now()
+		if goal and total < goal:
+			if drift < -1:
+				print(f"  {paint(f'▽ {-drift:.0f} oz behind an even pace for this hour', 'yellow')}")
+			elif drift > 1:
+				print(f"  {paint(f'△ {drift:.0f} oz ahead of an even pace for this hour', 'green')}")
+			else:
+				print(f"  {paint('◇ right on pace for this hour', 'dim')}")
 	else:
 		print(f"  {paint(f'{total:g} oz', 'bold')} {paint('· no goal set', 'dim')}")
 
