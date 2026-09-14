@@ -83,6 +83,9 @@ python3 waterTracker.py            # run the reminder loop
 python3 waterTracker.py status     # today's intake and entries
 python3 waterTracker.py week 7     # recent days, average, days at goal
 python3 waterTracker.py log 16     # log without texting: also "2 cups", "500ml"
+python3 waterTracker.py log 40 yesterday   # backfill a past day
+python3 waterTracker.py undo yesterday     # drop that day's last entry
+python3 waterTracker.py set 96 yesterday   # replace a day outright; 0 clears it
 python3 waterTracker.py test       # send one text to check delivery
 python3 waterTracker.py doctor     # explain why reminders are not arriving
 python3 waterTracker.py install    # write the LaunchAgent
@@ -191,6 +194,45 @@ Sun ██████░░░░ 60.3
 A test asserts the rule rather than the appearance: no texted line may contain
 a double space or leading padding. The 💧 stays first on every message — it's
 how the tracker recognises its own echo in a self-chat, not decoration.
+
+### Fixing a day you got wrong
+
+A day reference can go on `log`, `undo` and `set`, as `yesterday`, a weekday
+name, `3 days ago`, or `2026-09-10`:
+
+```
+$ python3 waterTracker.py log 40 yesterday
+✓ Added 40 oz to yesterday: 44 → 84 oz.
+
+$ python3 waterTracker.py set 96 yesterday
+✓ Set yesterday to 96 oz, was 84 oz.
+
+$ python3 waterTracker.py set 0 yesterday
+✓ Cleared yesterday: 96 → 0 oz.
+```
+
+`log` **adds** to a day and `set` **replaces** it — the distinction matters
+enough that the reply always states both the old figure and the new one. The
+same works by text: *"had 40 oz yesterday"*, *"forgot to log 30 on monday"*,
+*"make yesterday 90"*, *"I had nothing tuesday"*.
+
+Three things it refuses, rather than doing something surprising:
+
+| | Why |
+|---|---|
+| a day in the future | you can't have drunk it yet, so it's a typo |
+| a day past `WATER_KEEP_DAYS` | `prune_days` would delete it on the next run, so accepting the write would look like it worked and then lose the water |
+| a day reference it can't read | the fallback would be *today* — the one day an edit aimed at the past must never land on |
+
+A backfilled entry is stamped at **midday** on the day it belongs to, not the
+current time. The hour it was really drunk isn't known, and stamping yesterday's
+water with tonight's clock would order the day wrongly.
+
+One phrase needed special handling. `forgot` is a negation word — *"forgot to
+drink anything"* logs nothing, correctly. But *"forgot to **log** 30 oz
+yesterday"* is the opposite: the water happened and only the entry went
+missing, and it's how people actually phrase a backfill. The negation applies
+to the logging, not the drinking, and a test holds both readings apart.
 
 ### Texting it back
 
@@ -505,7 +547,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 201 tests, ~0.4s
+python3 -m unittest discover .        # 238 tests, ~0.5s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
@@ -546,6 +588,14 @@ connection error — so catching the base class too early would swallow the 401
 and 404 cases that have something specific to say, and the suite could not
 tell. The stand-in now mirrors the real hierarchy, and reordering either
 `except` chain fails.
+
+Editing past days was mutated the same way: dropping the retention guard,
+dropping the future guard, stamping a backfill with the current clock instead
+of midday on the day it belongs to, defaulting an unreadable day reference to
+today, letting `set` keep the entries it is supposed to replace, and putting
+`forgot` back as a plain negation each fails a named test. The last of those is
+the one worth keeping: it is the difference between "forgot to drink" and
+"forgot to log", which are opposite instructions that share a word.
 
 The terminal output was mutated the same way. Painting the bar inside
 `progress_line`, dropping the `NO_COLOR` and `TERM=dumb` gate, removing the

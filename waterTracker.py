@@ -38,6 +38,9 @@ Setup:
 	python waterTracker.py status     # print today's intake
 	python waterTracker.py week 7     # print recent days and the average
 	python waterTracker.py log 16     # log 16 oz without texting
+	python waterTracker.py log 40 yesterday   # or: monday, 3 days ago, 2026-09-10
+	python waterTracker.py undo yesterday     # drop that day's last entry
+	python waterTracker.py set 96 yesterday   # replace a day; 0 clears it
 	python waterTracker.py test       # send one text to check delivery
 	python waterTracker.py doctor     # explain why reminders are not arriving
 	python waterTracker.py install    # keep the loop running via launchd
@@ -60,6 +63,14 @@ Replies can be whole sentences — amounts and commands are picked out of the te
 	week / "my weekly average"         get the last 7 days
 	goal 120 / "set my goal to 120oz"  change the daily goal
 	undo / "scratch that"              drop the last entry
+	"had 40 oz yesterday"              log it against that day instead
+	"forgot to log 30 on monday"       the same, phrased the way people do
+	"make yesterday 90"                replace what a day says
+	"I had nothing tuesday"            clear a day
+
+	Past days can be edited for as long as they are kept (WATER_KEEP_DAYS).
+	Beyond that the day is already gone, and an edit is refused rather than
+	written and pruned on the next run.
 	pause / resume                     stop or restart today's nudges
 """
 
@@ -441,12 +452,20 @@ def quantity(raw: str) -> float:
 	return sum(NUMBER_WORDS.get(word, 0.0) for word in words)
 
 
+# "forgot to log 40 oz yesterday" is the opposite of a negation: the water was
+# drunk and the entry is what went missing. It is also the most natural way
+# anyone phrases a backfill, and "forgot" is a negation word, so the two would
+# cancel and drop the amount. Only the logging did not happen.
+FORGOT_TO_LOG_RE = re.compile(r"\bforgot\s+to\s+(?:log|record|enter|add|note|put\s+in)\b")
+
+
 def amount_is_negated(text: str) -> bool:
 	"""True when a negation comes before the first amount.
 
 	"haven't had 16 oz" is not 16 oz. A negation *after* the amount is a
 	different sentence — "had 16 oz but not the second bottle" still counts.
 	"""
+	text = FORGOT_TO_LOG_RE.sub(" ", text)
 	amount = AMOUNT_RE.search(text) or BARE_NUMBER_RE.search(text)
 	negation = NEGATION_RE.search(text)
 	return bool(amount and negation and negation.start() < amount.start())
@@ -509,7 +528,61 @@ def digits(handle: str) -> str:
 	return re.sub(r"\D", "", handle)[-10:]
 
 
-PLAN_ACTIONS = ("log", "status", "week", "goal", "undo", "pause", "resume", "later", "wake", "chat")
+WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Full weekday names only. The three-letter forms would be friendlier to type,
+# but "sat", "wed" and "sun" are ordinary English words, and a reply like "sat
+# down and had a glass" must not quietly land on Saturday.
+DAY_PHRASE = re.compile(
+	r"\b(?:on\s+|last\s+)?(?:"
+	r"(?P<today>today)"
+	r"|(?P<yesterday>yesterday)"
+	r"|(?P<iso>\d{4}-\d{1,2}-\d{1,2})"
+	r"|(?P<ago>\d+)\s+days?\s+ago"
+	r"|(?P<weekday>" + "|".join(WEEKDAY_NAMES) + r")"
+	r")\b",
+	re.IGNORECASE,
+)
+
+
+def split_day(text: str, today: date | None = None) -> tuple[date | None, str]:
+	"""Pull a day reference out of free text, with whatever is left of it.
+
+	Returns (None, text) when there is no reference, so a caller that finds
+	nothing simply carries on meaning today. A date in the future is resolved
+	rather than dropped: uneditable() is the one place that refuses a day, and
+	routing it there answers "that is in the future" instead of leaving the
+	digits in the text to be misread as an amount.
+	"""
+	today = today or date.today()
+	match = DAY_PHRASE.search(text)
+	if not match:
+		return None, text
+
+	if match.group("today"):
+		day = today
+	elif match.group("yesterday"):
+		day = today - timedelta(days=1)
+	elif match.group("iso"):
+		try:
+			year, month, number = (int(part) for part in match.group("iso").split("-"))
+			day = date(year, month, number)
+		except ValueError:  # 2026-13-45 and friends
+			return None, text
+	elif match.group("ago"):
+		day = today - timedelta(days=int(match.group("ago")))
+	else:
+		# The most recent one at or before today, so "monday" on a Monday means
+		# this morning rather than a week back.
+		behind = (today.weekday() - WEEKDAY_NAMES.index(match.group("weekday").lower())) % 7
+		day = today - timedelta(days=behind)
+
+	return day, f"{text[:match.start()]} {text[match.end():]}".strip()
+
+
+PLAN_ACTIONS = (
+	"log", "status", "week", "goal", "undo", "pause", "resume", "later", "wake", "set_day", "chat"
+)
 
 PLAN_SCHEMA = {
 	"type": "object",
@@ -527,8 +600,16 @@ PLAN_SCHEMA = {
 			"type": ["string", "null"],
 			"description": "One or two sentences answering the message. Only for action 'chat'.",
 		},
+		"day": {
+			"type": ["string", "null"],
+			"description": (
+				"Which day the sender means, only when they name one that is not today: "
+				"'yesterday', a weekday name, 'N days ago', or YYYY-MM-DD. "
+				"Null for anything about today, which is almost everything."
+			),
+		},
 	},
-	"required": ["action", "ounces", "goal_oz", "chat"],
+	"required": ["action", "ounces", "goal_oz", "chat", "day"],
 	"additionalProperties": False,
 }
 
@@ -548,6 +629,9 @@ Any drink counts, not only water.
 - week: they want recent days, an average, or a trend.
 - goal: they want to change the daily goal. Put it in `goal_oz`.
 - undo: they want the last entry removed, including "oops" and "that was wrong".
+- set_day: they are correcting a day to a figure they are sure of, replacing \
+whatever is logged: "make yesterday 90", "monday should have been 64", "I had \
+nothing on Tuesday" (which is 0). Put the figure in `ounces`, the day in `day`.
 - pause: they want reminders to stop for the day, including "going to bed".
 - resume: they want reminders to start again.
 - wake: they are telling you they just got up — "awake", "good morning", "just woke up". Today's pacing starts from now. Not for a message that merely mentions the morning while reporting a drink.
@@ -558,6 +642,12 @@ this for "not yet", "in a bit", and for anything they say they did NOT drink.
 
 Rules:
 - A negation means it did not happen: "haven't had my 16 oz yet" is later, not log.
+- `day` is for a day they actually name. "I forgot to log yesterday, had 40" is \
+log with ounces 40 and day "yesterday". Leave `day` null unless they name one \
+- almost every message is about today, and putting a past day on one of those \
+edits history they did not ask you to touch.
+- Adding to a past day is log with a `day`. Replacing what a day says is \
+set_day. "I had another 20 on Monday" adds; "Monday was 20" replaces.
 - Never invent numbers for status, week, or chat. The tracker fills those in.
 - Prefer log when they clearly drank something, even if the amount is vague.
 - Amounts above 400 oz are a mistake; treat those as chat and ask.
@@ -821,11 +911,27 @@ def sane_plan(plan: dict) -> dict | None:
 		if not isinstance(goal, (int, float)) or not 0 < goal <= MAX_LOG_OZ:
 			return None
 		plan["goal_oz"] = round(float(goal), 1)
+	if action == "set_day":
+		ounces = plan.get("ounces")
+		# 0 is meaningful here and nowhere else: it is how a day gets cleared.
+		if not isinstance(ounces, (int, float)) or not 0 <= ounces <= MAX_LOG_OZ:
+			return None
+		plan["ounces"] = round(float(ounces), 1)
 	if action == "chat":
 		chat = (plan.get("chat") or "").strip()
 		if not chat:
 			return None
 		plan["chat"] = chat[:MAX_CHAT_CHARS]
+	# A day the model named but that cannot be read is refused rather than
+	# guessed at: the fallback would be today, which is the one day an edit
+	# aimed at the past must never land on.
+	named = plan.get("day")
+	plan["day"] = None
+	if named:
+		resolved, _ = split_day(str(named))
+		if resolved is None:
+			return None
+		plan["day"] = resolved
 	return plan
 
 
@@ -1081,6 +1187,12 @@ def ago(stamp: str) -> str:
 	return f"{hours}h ago" if not rest else f"{hours}h {rest}m ago"
 
 
+def report(changed: bool, message: str) -> None:
+	"""Print the outcome of a history edit, ticked only if it happened."""
+	mark = paint("\u2713", "green") if changed else paint("\u2717", "red")
+	print(f"{mark} {message if changed else paint(message, 'red')}")
+
+
 def heading(text: str) -> None:
 	print(f"\n{paint(text, 'bold', 'cyan')}\n")
 
@@ -1247,7 +1359,95 @@ class WaterTracker:
 		return date.today().isoformat()
 
 	def entries(self) -> list[dict]:
-		return self.state["days"].setdefault(self.today(), [])
+		return self.day_entries(date.today())
+
+	def day_entries(self, day: date) -> list[dict]:
+		return self.state["days"].setdefault(day.isoformat(), [])
+
+	def day_name(self, day: date) -> str:
+		"""How to refer to a day in a reply, from the reader's point of view."""
+		today = date.today()
+		if day == today:
+			return "today"
+		if day == today - timedelta(days=1):
+			return "yesterday"
+		return f"{day:%a %-d %b}"
+
+	def uneditable(self, day: date) -> str | None:
+		"""Why a day cannot be edited, or None when it can.
+
+		Retention is the real constraint. prune_days drops anything past the
+		window on the next run, so writing to a day older than that would
+		appear to work and then silently vanish.
+		"""
+		today = date.today()
+		if day > today:
+			return f"{day.isoformat()} is in the future, so nothing was changed."
+		if day < today - timedelta(days=KEEP_DAYS):
+			return (
+				f"{day.isoformat()} is outside the {KEEP_DAYS}-day history window "
+				"and would be pruned, so nothing was changed."
+			)
+		return None
+
+	def forget_if_empty(self, day: date) -> None:
+		"""Drop a day left with no entries, so reading it back reports nothing."""
+		if not self.state["days"].get(day.isoformat()):
+			self.state["days"].pop(day.isoformat(), None)
+
+	def backfill(self, day: date, ounces: float, source: str = "backfill") -> tuple[bool, str]:
+		"""Log an amount against a past day, stamped at midday on it.
+
+		Midday, not the current clock: the hour it was actually drunk is not
+		known, and stamping yesterday's water with tonight's time would put the
+		entry in an order the day never had.
+		"""
+		problem = self.uneditable(day)
+		if problem:
+			return False, problem
+		before = self.day_total(day)
+		when = datetime.now() if day == date.today() else datetime(day.year, day.month, day.day, 12)
+		self.day_entries(day).append(
+			{"at": when.isoformat(timespec="seconds"), "oz": round(ounces, 1), "via": source}
+		)
+		self.save()
+		return True, f"Added {ounces:g} oz to {self.day_name(day)}: {before:g} → {self.day_total(day):g} oz."
+
+	def undo_on(self, day: date) -> tuple[bool, str]:
+		"""Drop the most recent entry from any day."""
+		problem = self.uneditable(day)
+		if problem:
+			return False, problem
+		entries = self.day_entries(day)
+		if not entries:
+			self.forget_if_empty(day)
+			return False, f"Nothing logged {self.day_name(day)}."
+		dropped = entries.pop()
+		self.forget_if_empty(day)
+		self.save()
+		return True, f"Removed {dropped['oz']:g} oz from {self.day_name(day)}: now {self.day_total(day):g} oz."
+
+	def set_day_total(self, day: date, ounces: float) -> tuple[bool, str]:
+		"""Replace a day outright with one figure, or clear it with zero.
+
+		The old entries go: this is for when the log is wrong rather than
+		incomplete, and keeping them would leave the total disagreeing with
+		the entries that are supposed to add up to it.
+		"""
+		problem = self.uneditable(day)
+		if problem:
+			return False, problem
+		before = self.day_total(day)
+		if ounces <= 0:
+			self.state["days"].pop(day.isoformat(), None)
+			self.save()
+			return True, f"Cleared {self.day_name(day)}: {before:g} → 0 oz."
+		when = datetime(day.year, day.month, day.day, 12)
+		self.state["days"][day.isoformat()] = [
+			{"at": when.isoformat(timespec="seconds"), "oz": round(ounces, 1), "via": "corrected"}
+		]
+		self.save()
+		return True, f"Set {self.day_name(day)} to {ounces:g} oz, was {before:g} oz."
 
 	def total(self) -> float:
 		return sum(entry["oz"] for entry in self.entries())
@@ -1590,12 +1790,8 @@ class WaterTracker:
 		return "No problem, I'll check back later."
 
 	def undo(self) -> str:
-		entries = self.entries()
-		if not entries:
-			return "Nothing logged today yet."
-		dropped = entries.pop()
-		self.save()
-		return f"Removed {dropped['oz']:g} oz. Now {self.progress_line()}"
+		"""Drop today's last entry. One shape of undo_on, not a second copy."""
+		return self.undo_on(date.today())[1]
 
 	def set_goal(self, ounces: float) -> str:
 		self.state["goal_oz"] = round(ounces, 1)
@@ -1658,8 +1854,13 @@ class WaterTracker:
 		than a confidently invented total.
 		"""
 		action = plan["action"]
-		if action == "log":
+		day = plan.get("day")
+		if action == "log" and day and day != date.today():
+			self.send(self.backfill(day, plan["ounces"], "reply")[1])
+		elif action == "log":
 			self.log_reply(plan["ounces"])
+		elif action == "set_day":
+			self.send(self.set_day_total(day or date.today(), plan["ounces"])[1])
 		elif action == "goal":
 			self.send(self.set_goal(plan["goal_oz"]))
 		elif action == "status":
@@ -1667,7 +1868,7 @@ class WaterTracker:
 		elif action == "week":
 			self.send("\n".join(self.week_lines()))
 		elif action == "undo":
-			self.send(self.undo())
+			self.send(self.undo_on(day or date.today())[1])
 		elif action == "pause":
 			self.send(self.pause())
 		elif action == "resume":
@@ -1719,12 +1920,35 @@ class WaterTracker:
 			self.send(self.set_goal(float(goal_match.group(1)) * factor))
 			return
 
-		intent = detect_intent(text)
-		if intent == "undo":
-			self.send(self.undo())
+		# The day comes out before any amount is read, or the digits of a date
+		# would be picked up as ounces. What is left is what gets parsed.
+		day, without_day = split_day(text)
+
+		# Replacing a day rather than adding to it needs saying, so this only
+		# fires on a word that means correction. Without one, "40 yesterday"
+		# stays an addition, which is the safer of the two to get wrong.
+		if day and re.search(r"\b(?:make|set|should(?:'ve| have)? been|was actually)\b", text):
+			correction = extract_ounces(without_day)
+			if correction is not None:
+				self.send(self.set_day_total(day, correction)[1])
+				return
+
+		# "nothing on Tuesday" carries no number to extract, but it is a figure
+		# the sender is sure of, which makes it a correction rather than a gap.
+		if day and re.search(r"\b(?:nothing|none|zero|no water)\b", text):
+			self.send(self.set_day_total(day, 0)[1])
 			return
 
-		ounces = extract_ounces(text)
+		intent = detect_intent(text)
+		if intent == "undo":
+			self.send(self.undo_on(day or date.today())[1])
+			return
+
+		ounces = extract_ounces(without_day)
+		if ounces is not None and day and day != date.today() and not amount_is_negated(text):
+			self.send(self.backfill(day, ounces, "reply")[1])
+			return
+
 		if ounces is not None and not amount_is_negated(text):
 			# One sentence can do both: "had 20 oz, you can stop for today".
 			note = ""
@@ -2332,13 +2556,32 @@ def main(argv: list[str]) -> None:
 		print_week(tracker, days)
 	elif command == "log":
 		if len(argv) < 2:
-			raise SystemExit("Usage: python waterTracker.py log 16")
-		ounces = extract_ounces(" ".join(argv[1:]))
+			raise SystemExit("Usage: python waterTracker.py log 16 [yesterday|monday|2026-09-10]")
+		# The day comes out first, or extract_ounces would read the digits of
+		# "2026-09-10" as an amount.
+		day, rest = split_day(" ".join(argv[1:]))
+		ounces = extract_ounces(rest)
 		if ounces is None:
 			raise SystemExit("Could not read that amount, try '16' or '2 cups'.")
-		tracker.add(ounces, "cli")
-		print(f"{paint('✓', 'green')} logged {paint(f'{ounces:g} oz', 'bold')}")
-		print_status(tracker)
+		if day is None or day == date.today():
+			tracker.add(ounces, "cli")
+			print(f"{paint('✓', 'green')} logged {paint(f'{ounces:g} oz', 'bold')}")
+			print_status(tracker)
+		else:
+			report(*tracker.backfill(day, ounces, "cli"))
+	elif command == "undo":
+		day, _ = split_day(" ".join(argv[1:]))
+		report(*tracker.undo_on(day or date.today()))
+	elif command == "set":
+		if len(argv) < 2:
+			raise SystemExit("Usage: python waterTracker.py set 96 yesterday")
+		day, rest = split_day(" ".join(argv[1:]))
+		# Zero is how a day gets cleared, so an explicit 0 has to survive a
+		# parser whose job everywhere else is to reject it.
+		ounces = 0.0 if re.fullmatch(r"\s*0\s*(oz)?\s*", rest) else extract_ounces(rest)
+		if ounces is None:
+			raise SystemExit("Could not read that amount, try '96' or '0' to clear the day.")
+		report(*tracker.set_day_total(day or date.today(), ounces))
 	elif command == "test":
 		# push=True on purpose: this command exists to prove delivery, and the
 		# push is now the half that actually notifies.
@@ -2354,7 +2597,7 @@ def main(argv: list[str]) -> None:
 	else:
 		raise SystemExit(
 			f"Unknown command {command!r}. "
-			"Use run, status, week, log, test, doctor, or install."
+			"Use run, status, week, log, undo, set, test, doctor, or install."
 		)
 
 

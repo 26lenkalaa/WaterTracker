@@ -723,8 +723,10 @@ class LlmPlanTest(LlmTestCase):
 
 	def test_reads_a_valid_answer(self):
 		self.install(fake_answer({"action": "log", "ounces": 24, "goal_oz": None, "chat": None}))
+		# day is normalised onto every plan, so a caller never has to ask
+		# whether the key is there before reading it.
 		self.assertEqual(wt.llm_plan("finished the one on my desk"), {
-			"action": "log", "ounces": 24.0, "goal_oz": None, "chat": None,
+			"action": "log", "ounces": 24.0, "goal_oz": None, "chat": None, "day": None,
 		})
 
 	def test_asks_for_json_from_the_configured_model(self):
@@ -1189,6 +1191,285 @@ class WeekTest(TrackerTestCase):
 		self.tracker.handle_reply("what was my weekly average")
 		self.assertIn("oz/day average", self.sent[-1])
 		self.assertEqual(self.tracker.total(), 0, "a question logged an amount")
+
+
+class SplitDayTest(unittest.TestCase):
+	"""Reading a day out of free text, and what it leaves behind."""
+
+	def setUp(self):
+		self.today = date(2026, 9, 12)  # a Saturday, so every weekday is reachable
+
+	def split(self, text):
+		return wt.split_day(text, today=self.today)
+
+	def test_reads_every_form_it_offers(self):
+		cases = {
+			"40 oz today": date(2026, 9, 12),
+			"40 oz yesterday": date(2026, 9, 11),
+			"40 oz on 2026-09-05": date(2026, 9, 5),
+			"40 oz 2026-9-5": date(2026, 9, 5),
+			"40 oz 3 days ago": date(2026, 9, 9),
+			"40 oz on monday": date(2026, 9, 7),
+			"40 oz last friday": date(2026, 9, 11),
+		}
+		for text, expected in cases.items():
+			with self.subTest(text=text):
+				self.assertEqual(self.split(text)[0], expected)
+
+	def test_a_weekday_resolves_to_the_most_recent_one(self):
+		# Today is Saturday, so "saturday" means this morning rather than a
+		# week ago -- the reading someone glancing at their phone expects.
+		self.assertEqual(self.split("saturday")[0], self.today)
+
+	def test_the_day_is_taken_out_of_what_is_left(self):
+		# extract_ounces runs on the remainder, so a date left in it would have
+		# its digits read as an amount.
+		day, rest = self.split("forgot to log 30 oz on 2026-09-05")
+		self.assertEqual(day, date(2026, 9, 5))
+		self.assertNotIn("2026", rest)
+		self.assertEqual(wt.extract_ounces(rest), 30)
+
+	def test_no_reference_leaves_the_text_alone(self):
+		self.assertEqual(self.split("had a couple glasses"), (None, "had a couple glasses"))
+
+	def test_short_weekday_names_are_not_matched(self):
+		# "sat", "wed" and "sun" are ordinary words; matching them would land
+		# an entry on a day nobody named.
+		for text in ("sat down and had a glass", "wed to my water bottle", "out in the sun"):
+			with self.subTest(text=text):
+				self.assertIsNone(self.split(text)[0])
+
+	def test_an_impossible_date_is_not_a_day(self):
+		self.assertEqual(self.split("40 oz on 2026-13-45")[0], None)
+
+	def test_a_future_date_is_returned_for_the_guard_to_refuse(self):
+		# Resolved rather than dropped: uneditable() gives a straight answer,
+		# where leaving it in the text would surface as "could not read that
+		# amount", which is not what went wrong.
+		self.assertEqual(self.split("40 oz on 2027-01-01")[0], date(2027, 1, 1))
+
+
+class HistoryEditTest(TrackerTestCase):
+	"""Changing a day that is not today."""
+
+	def setUp(self):
+		super().setUp()
+		self.yesterday = date.today() - timedelta(days=1)
+
+	def test_backfill_adds_to_a_past_day_without_touching_today(self):
+		self.set_day(self.yesterday, 44)
+		changed, message = self.tracker.backfill(self.yesterday, 20)
+		self.assertTrue(changed)
+		self.assertEqual(self.tracker.day_total(self.yesterday), 64)
+		self.assertEqual(self.tracker.total(), 0, "backfilling moved today's total")
+		self.assertIn("44", message)
+		self.assertIn("64", message)
+
+	def test_a_backfilled_entry_is_stamped_on_the_day_it_belongs_to(self):
+		# Stamping it with the current clock would file yesterday's water under
+		# tonight's hour, and the entry list is ordered by that stamp.
+		self.tracker.backfill(self.yesterday, 20)
+		stamp = self.tracker.day_entries(self.yesterday)[0]["at"]
+		self.assertTrue(stamp.startswith(self.yesterday.isoformat()), stamp)
+		self.assertEqual(datetime.fromisoformat(stamp).hour, 12, "not filed at midday")
+
+	def test_undo_reaches_a_past_day(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.backfill(self.yesterday, 20)
+		changed, _ = self.tracker.undo_on(self.yesterday)
+		self.assertTrue(changed)
+		self.assertEqual(self.tracker.day_total(self.yesterday), 44, "dropped the wrong entry")
+
+	def test_undo_on_an_empty_day_changes_nothing(self):
+		changed, message = self.tracker.undo_on(self.yesterday)
+		self.assertFalse(changed, "reported a removal that did not happen")
+		self.assertIn("Nothing logged", message)
+
+	def test_setting_a_day_replaces_what_was_there(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.backfill(self.yesterday, 20)
+		changed, message = self.tracker.set_day_total(self.yesterday, 96)
+		self.assertTrue(changed)
+		self.assertEqual(self.tracker.day_total(self.yesterday), 96)
+		self.assertEqual(len(self.tracker.day_entries(self.yesterday)), 1, "left the old entries")
+		self.assertIn("was 64", message, "did not say what it replaced")
+
+	def test_setting_a_day_to_zero_clears_it(self):
+		self.set_day(self.yesterday, 44)
+		changed, _ = self.tracker.set_day_total(self.yesterday, 0)
+		self.assertTrue(changed)
+		self.assertEqual(self.tracker.day_total(self.yesterday), 0)
+		self.assertNotIn(self.yesterday.isoformat(), self.tracker.state["days"], "left an empty day")
+
+	def test_the_future_is_refused(self):
+		for edit in (
+			lambda day: self.tracker.backfill(day, 20),
+			lambda day: self.tracker.set_day_total(day, 20),
+			lambda day: self.tracker.undo_on(day),
+		):
+			with self.subTest(edit=edit):
+				changed, message = edit(date.today() + timedelta(days=1))
+				self.assertFalse(changed)
+				self.assertIn("future", message)
+
+	def test_a_day_past_retention_is_refused_rather_than_silently_pruned(self):
+		# prune_days would drop it on the next run, so accepting the write
+		# would look like it worked and then lose the water.
+		stale = date.today() - timedelta(days=wt.KEEP_DAYS + 1)
+		changed, message = self.tracker.backfill(stale, 20)
+		self.assertFalse(changed)
+		self.assertIn("history window", message)
+		self.assertNotIn(stale.isoformat(), self.tracker.state["days"])
+
+	def test_edits_survive_a_reload(self):
+		self.tracker.backfill(self.yesterday, 20)
+		self.tracker.set_day_total(self.yesterday - timedelta(days=1), 50)
+		reopened = wt.WaterTracker()
+		self.assertEqual(reopened.day_total(self.yesterday), 20)
+		self.assertEqual(reopened.day_total(self.yesterday - timedelta(days=1)), 50)
+
+
+class HistoryByTextTest(TrackerTestCase):
+	"""The same edits, reached the way they actually will be: by message."""
+
+	def setUp(self):
+		super().setUp()
+		self.yesterday = date.today() - timedelta(days=1)
+
+	def test_a_past_day_is_backfilled_not_logged_to_today(self):
+		self.tracker.handle_reply("had 40 oz yesterday")
+		self.assertEqual(self.tracker.day_total(self.yesterday), 40)
+		self.assertEqual(self.tracker.total(), 0, "logged a past day against today")
+
+	def test_forgetting_to_log_is_not_a_negation(self):
+		# "forgot" negates the logging, not the drinking, and it is how anyone
+		# phrases a backfill. The water happened; only the entry did not.
+		self.tracker.handle_reply("forgot to log 30 oz yesterday")
+		self.assertEqual(self.tracker.day_total(self.yesterday), 30)
+
+	def test_forgetting_to_drink_still_logs_nothing(self):
+		for text in ("forgot to drink anything yesterday", "haven't had 16 oz yet"):
+			with self.subTest(text=text):
+				self.setUp()
+				self.tracker.handle_reply(text)
+				self.assertEqual(self.tracker.day_total(self.yesterday), 0)
+				self.assertEqual(self.tracker.total(), 0)
+
+	def test_a_correction_replaces_and_a_plain_amount_adds(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.handle_reply("had another 20 oz yesterday")
+		self.assertEqual(self.tracker.day_total(self.yesterday), 64, "a plain amount replaced")
+		self.tracker.handle_reply("make yesterday 90")
+		self.assertEqual(self.tracker.day_total(self.yesterday), 90, "a correction added")
+
+	def test_nothing_on_a_day_clears_it(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.handle_reply("I had nothing yesterday")
+		self.assertEqual(self.tracker.day_total(self.yesterday), 0)
+
+	def test_undo_without_a_day_still_means_today(self):
+		self.tracker.add(16, "reply")
+		self.set_day(self.yesterday, 44)
+		self.tracker.handle_reply("undo")
+		self.assertEqual(self.tracker.total(), 0)
+		self.assertEqual(self.tracker.day_total(self.yesterday), 44, "undo reached back a day")
+
+	def test_a_bare_amount_is_untouched_by_any_of_this(self):
+		self.tracker.handle_reply("16 oz")
+		self.assertEqual(self.tracker.total(), 16)
+
+
+class HistoryCommandTest(TrackerTestCase):
+	"""log/undo/set from the command line, where a day is an argument."""
+
+	def setUp(self):
+		super().setUp()
+		self.yesterday = date.today() - timedelta(days=1)
+		self.patch(wt, "colour_ready", lambda: False)
+
+	def run_command(self, *argv):
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.main(list(argv))
+		return printed.getvalue()
+
+	def reload(self):
+		"""main() works through its own tracker, so read the file back."""
+		return wt.WaterTracker()
+
+	def test_log_with_a_day_backfills_and_without_one_does_not(self):
+		self.run_command("log", "40", "yesterday")
+		self.run_command("log", "16")
+		tracker = self.reload()
+		self.assertEqual(tracker.day_total(self.yesterday), 40)
+		self.assertEqual(tracker.total(), 16)
+
+	def test_a_date_argument_is_not_read_as_an_amount(self):
+		# "2026-09-11" is full of digits; the day has to come out of the text
+		# before extract_ounces ever sees it.
+		self.run_command("log", "12", self.yesterday.isoformat())
+		self.assertEqual(self.reload().day_total(self.yesterday), 12)
+
+	def test_units_still_work_alongside_a_day(self):
+		self.run_command("log", "2", "cups", "yesterday")
+		self.assertEqual(self.reload().day_total(self.yesterday), 16)
+
+	def test_set_clears_a_day_with_an_explicit_zero(self):
+		self.run_command("log", "40", "yesterday")
+		self.run_command("set", "0", "yesterday")
+		self.assertEqual(self.reload().day_total(self.yesterday), 0)
+
+	def test_undo_takes_a_day(self):
+		self.run_command("log", "40", "yesterday")
+		self.run_command("log", "16", "yesterday")
+		self.run_command("undo", "yesterday")
+		self.assertEqual(self.reload().day_total(self.yesterday), 40)
+
+	def test_a_refused_edit_is_not_reported_as_done(self):
+		output = self.run_command("log", "12", "2030-01-01")
+		self.assertIn("✗", output)
+		self.assertNotIn("✓", output)
+		self.assertIn("future", output)
+
+	def test_a_completed_edit_is_ticked(self):
+		self.assertIn("✓", self.run_command("log", "40", "yesterday"))
+
+
+class HistoryPlanTest(TrackerTestCase):
+	"""What the model is allowed to say about a day, and what happens then."""
+
+	def plan(self, **fields):
+		full = {"action": "log", "ounces": None, "goal_oz": None, "chat": None, "day": None}
+		return wt.sane_plan({**full, **fields})
+
+	def test_a_named_day_is_resolved_to_a_date(self):
+		self.assertEqual(self.plan(action="log", ounces=20, day="yesterday")["day"],
+		                 date.today() - timedelta(days=1))
+
+	def test_an_unreadable_day_is_refused_rather_than_defaulted(self):
+		# Falling back to today is the one wrong answer available: an edit
+		# aimed at the past would land on the day that is still being filled.
+		self.assertIsNone(self.plan(action="log", ounces=20, day="whenever"))
+
+	def test_every_plan_carries_a_day_key(self):
+		self.assertIn("day", self.plan(action="status"))
+
+	def test_set_day_accepts_zero_but_log_does_not(self):
+		self.assertIsNotNone(self.plan(action="set_day", ounces=0, day="yesterday"))
+		self.assertIsNone(self.plan(action="log", ounces=0))
+
+	def test_set_day_still_refuses_an_absurd_amount(self):
+		self.assertIsNone(self.plan(action="set_day", ounces=wt.MAX_LOG_OZ + 1, day="yesterday"))
+
+	def test_the_plan_reaches_the_right_edit(self):
+		yesterday = date.today() - timedelta(days=1)
+		self.set_day(yesterday, 44)
+		self.tracker.follow_plan(self.plan(action="log", ounces=20, day="yesterday"))
+		self.assertEqual(self.tracker.day_total(yesterday), 64)
+		self.tracker.follow_plan(self.plan(action="set_day", ounces=10, day="yesterday"))
+		self.assertEqual(self.tracker.day_total(yesterday), 10)
+		self.tracker.follow_plan(self.plan(action="undo", day="yesterday"))
+		self.assertEqual(self.tracker.day_total(yesterday), 0)
 
 
 class AgoTest(unittest.TestCase):
