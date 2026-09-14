@@ -1,0 +1,11 @@
+# Checkers only. Nothing here is needed to run the tracker or the tests --
+# `python3 -m unittest discover .` uses the standard library alone.
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/mypy
+#   .venv/bin/pylint waterTracker.py test_waterTracker.py
+#
+# Both read their settings from pyproject.toml, which records why each
+# disabled check is disabled.
+mypy>=1.11
+pylint>=3.2

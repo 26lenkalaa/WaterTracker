@@ -32,6 +32,9 @@ os.environ.setdefault("WATER_PHONE", "+15551234567")
 # otherwise send every test reply to the real API.
 os.environ["WATER_LLM"] = "off"
 _spec = importlib.util.spec_from_file_location("waterTracker", Path(__file__).with_name("waterTracker.py"))
+# Both are None if the file is not where this expects it. Saying so here turns
+# "NoneType has no attribute loader" into the sentence that explains it.
+assert _spec and _spec.loader, "waterTracker.py must sit next to test_waterTracker.py"
 wt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wt)
 
@@ -282,8 +285,7 @@ class InstallTest(unittest.TestCase):
 		# launchd inherits nothing, so a setting missing from this list is one
 		# you can export, see work in the foreground, and never get from the
 		# background job. Six were missing when this test was written.
-		import re
-		source = Path(wt.__file__).read_text()
+		source = Path(wt.__file__).read_text(encoding="utf-8")
 		declared = set(re.findall(r'os\.getenv\("(WATER_[A-Z_]+)"', source))
 		block = re.search(r"for name in \(\s*(.*?)\s*\):", source, re.S).group(1)
 		carried = set(re.findall(r'"([A-Z_]+)"', block))
@@ -1305,7 +1307,7 @@ class HistoryEditTest(TrackerTestCase):
 		for edit in (
 			lambda day: self.tracker.backfill(day, 20),
 			lambda day: self.tracker.set_day_total(day, 20),
-			lambda day: self.tracker.undo_on(day),
+			self.tracker.undo_on,
 		):
 			with self.subTest(edit=edit):
 				changed, message = edit(date.today() + timedelta(days=1))
@@ -1512,7 +1514,7 @@ class LazyImportTest(unittest.TestCase):
 		state = Path(tempfile.mkdtemp()) / "state.json"
 		done = subprocess.run(
 			[sys.executable, "-c", script, str(Path(wt.__file__).resolve()), str(state), *argv],
-			capture_output=True, text=True,
+			capture_output=True, text=True, check=False,
 			env={**os.environ, "WATER_PHONE": "+15551234567", "WATER_LLM": "auto"},
 		)
 		self.assertEqual(done.returncode, 0, done.stderr)
@@ -1551,8 +1553,12 @@ class ColourTest(unittest.TestCase):
 		self.addCleanup(self.restore)
 
 	def restore(self):
+		"""Put the environment back exactly as it was, unset included."""
 		for name, value in self.saved.items():
-			os.environ.pop(name, None) if value is None else os.environ.update({name: value})
+			if value is None:
+				os.environ.pop(name, None)
+			else:
+				os.environ[name] = value
 
 	def tty(self, is_tty=True):
 		"""Point sys.stdout at a buffer that claims to be (or not be) a terminal."""
@@ -1576,7 +1582,10 @@ class ColourTest(unittest.TestCase):
 					with redirect_stdout(self.tty(True)):
 						self.assertFalse(wt.colour_ready())
 				finally:
-					os.environ.pop(name, None) if previous is None else os.environ.update({name: previous})
+					if previous is None:
+						os.environ.pop(name, None)
+					else:
+						os.environ[name] = previous
 
 	def test_paint_is_a_no_op_without_a_terminal(self):
 		with redirect_stdout(self.tty(False)):
@@ -1657,7 +1666,10 @@ class TerminalOutputTest(TrackerTestCase):
 		for expected, wording in ((0.0, "ahead of an even pace"), (100.0, "behind an even pace")):
 			with self.subTest(expected=expected):
 				self.setUp()
-				self.patch(wt.WaterTracker, "expected_by_now", lambda self, now=None: expected)
+				self.patch(
+					wt.WaterTracker, "expected_by_now",
+					lambda self, now=None, expected=expected: expected,
+				)
 				self.assertIn(wording, self.render(["status"], colour=False))
 
 	def test_a_met_goal_drops_the_pace_line(self):
@@ -1767,7 +1779,7 @@ class NormalisePhotoTest(unittest.TestCase):
 		target = self.folder / name
 		done = subprocess.run(
 			["sips", "-s", "format", fmt, str(self.seed_png()), "--out", str(target)],
-			capture_output=True, text=True,
+			capture_output=True, text=True, check=False,
 		)
 		if done.returncode != 0 or not target.exists():
 			self.skipTest(f"this machine's sips cannot write {fmt}")

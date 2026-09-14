@@ -625,6 +625,46 @@ check's arguments are checked against the installed SDK's signature, but no
 test proves the service accepts them. The one failure the check can't fake is
 success: verifying a *working* key needs a working key.
 
+## Type checking and linting
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/mypy                                        # clean
+.venv/bin/pylint waterTracker.py test_waterTracker.py # 10.00/10
+```
+
+Neither is needed to run the tracker or the tests. Settings live in
+`pyproject.toml`, and every disabled check there carries the reason it is off —
+a check switched off because the code is wrong would only be hiding the bug.
+
+Two of those reasons are worth stating here, because they look like evasions
+and are not:
+
+**Tabs.** 2861 of pylint's 3268 default complaints were `bad-indentation`,
+because its default is four spaces and this file has used tabs since the first
+commit. That is a config mismatch, not 2861 defects; reindenting ~4500 lines
+would change no behaviour and settle nothing. `indent-string = "\t"` states the
+convention instead.
+
+**Not `--strict`.** The state file is JSON, so it arrives as `Any` whatever the
+config says, and the casts needed to pretend otherwise would clutter every read
+without adding safety. The checks that catch real mistakes — a `None` reaching
+something that can't take one, an attribute that doesn't exist — are on by
+default, and the code is clean under them.
+
+Running them found four things worth fixing rather than configuring away:
+
+| Finding | Why it mattered |
+|---|---|
+| `open()` and `read_text()` with no encoding | both default to the locale's, so a machine not running UTF-8 could fail to read its own log |
+| `anthropic` typed as `object` | the lazy-import sentinel narrowed the module away, putting an error on all 18 `except anthropic.X` handlers |
+| a local `note` shadowing the `note()` helper | one name meant two things in the same file |
+| a lambda capturing a loop variable late | it works today because it's called in-iteration, but this suite has already had one loop where that made every case after the first vacuous |
+
+`require_phone()` now returns the handle it validated rather than returning
+`None` and leaving callers to reach for the attribute again — the invariant is
+enforced in one place and visible to both a reader and the checker.
+
 ## Troubleshooting
 
 Run `doctor` first; it checks the things that fail silently and prints the

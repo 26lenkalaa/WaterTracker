@@ -12,3 +12,8 @@ __pycache__/
 .pytest_cache/
 
 .DS_Store
+
+# Checker caches and the venv from requirements-dev.txt
+.mypy_cache/
+.pylint.d/
+.venv/

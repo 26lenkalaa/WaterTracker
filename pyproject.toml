@@ -1,0 +1,91 @@
+# Configuration for mypy and pylint. There is no build here -- waterTracker.py
+# is a single script you run directly -- so this file exists only to tell the
+# two checkers what this project's conventions actually are.
+#
+# Everything switched off below is switched off for a stated reason. A check
+# disabled because the code is wrong would just be hiding the bug.
+
+[tool.mypy]
+python_version = "3.10"          # the floor the README promises
+files = ["waterTracker.py", "test_waterTracker.py"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+# Not strict mode. The state file is JSON, so it arrives as Any no matter what
+# is written here, and the casts needed to pretend otherwise would add noise to
+# every read for no extra safety. The checks that catch real mistakes -- a None
+# reaching something that cannot take one, an attribute that does not exist --
+# are all on by default and the code is clean under them.
+
+[[tool.mypy.overrides]]
+# anthropic is optional: the tracker falls back to pattern matching when it is
+# absent, which is also how CI and a fresh checkout will see it.
+module = ["anthropic", "anthropic.*"]
+ignore_missing_imports = true
+
+[tool.pylint.main]
+# Tabs. 2861 of pylint's 3268 default complaints were bad-indentation, because
+# its default is four spaces and this file has used tabs from the first commit.
+# Reindenting ~4500 lines would change no behaviour and settle nothing.
+indent-string = "\t"
+
+[tool.pylint.format]
+# The code wraps at 100; 110 leaves room for the handful of lines where
+# breaking one would cost more in readability than it buys.
+max-line-length = 110
+
+[tool.pylint.basic]
+# "bar" is a progress bar here, not a foo/bar placeholder.
+bad-names = ["foo", "baz", "toto", "tutu", "tata"]
+# waterTracker.py is named in the LaunchAgent plist, the README and every
+# published instruction; snake_case would be a rename with real consequences
+# and no benefit. The module-level LLM cache is deliberately mutable state, so
+# it is lower_case rather than a CONSTANT.
+module-rgx = "^[a-zA-Z_][a-zA-Z0-9_]*$"
+# A leading underscore is this file's mark for "internal to this module",
+# and it goes on both the mutable caches and the compiled-regex constants.
+const-rgx = "^(_?[a-z][a-z0-9_]*|_?[A-Z][A-Z0-9_]*|__.*__)$"
+
+[tool.pylint."messages control"]
+disable = [
+	# Docstrings are here to say *why*, and most of this file's functions are
+	# one line whose name already says what. Requiring one on entries() or
+	# today() would mean writing "returns the entries" 286 times.
+	"missing-function-docstring",
+	"missing-class-docstring",
+
+	# Size limits. doctor() is a long list of checks and handle_reply() is a
+	# long list of ways to read a message; both are linear, and splitting
+	# either to satisfy a count would scatter one readable sequence.
+	"too-many-branches",
+	"too-many-statements",
+	"too-many-return-statements",
+	"too-many-locals",
+	"too-many-public-methods",
+	"too-few-public-methods",
+	"too-many-lines",
+
+	# Deliberate, and documented at each site: a failing SDK call, a failing
+	# push and a failing osascript all have to degrade rather than raise, or a
+	# reminder loop dies on someone's laptop overnight.
+	"broad-exception-caught",
+
+	# The LLM client and the SDK handle are module-level caches, which is what
+	# makes them worth caching.
+	"global-statement",
+
+	# The two lazy imports are the point: anthropic costs 258ms and saxutils
+	# 12ms, and status/week/log use neither. See the comments at both sites.
+	"import-outside-toplevel",
+
+	# Tests reach into module internals on purpose -- that is most of what
+	# these tests do, and the alternative is a public API invented for them.
+	"protected-access",
+	"redefined-outer-name",
+	"unused-argument",
+
+	# The stand-in Messages database is held open across a test on purpose:
+	# WAL mode behaves differently once the connection closes, and that
+	# difference is the thing under test.
+	"consider-using-with",
+]

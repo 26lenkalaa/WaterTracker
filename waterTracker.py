@@ -88,6 +88,7 @@ import time
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 GOAL_OZ = float(os.getenv("WATER_GOAL_OZ", "100"))
 INTERVAL_MIN = int(os.getenv("WATER_INTERVAL_MIN", "120"))
@@ -144,10 +145,12 @@ MAX_CHAT_CHARS = 300
 # raised, and every path that can reach one calls llm_ready() or llm_check()
 # first.
 _UNLOADED = object()
-anthropic = _UNLOADED
+# Any, not object: the sentinel would otherwise narrow the module away and put
+# an error on every `except anthropic.X` handler below.
+anthropic: Any = _UNLOADED
 
 
-def load_anthropic():
+def load_anthropic() -> Any:
 	"""Import the SDK on first use. None when it is not installed.
 
 	Assigning waterTracker.anthropic directly still wins: the sentinel is what
@@ -634,7 +637,9 @@ whatever is logged: "make yesterday 90", "monday should have been 64", "I had \
 nothing on Tuesday" (which is 0). Put the figure in `ounces`, the day in `day`.
 - pause: they want reminders to stop for the day, including "going to bed".
 - resume: they want reminders to start again.
-- wake: they are telling you they just got up — "awake", "good morning", "just woke up". Today's pacing starts from now. Not for a message that merely mentions the morning while reporting a drink.
+- wake: they are telling you they just got up — "awake", "good morning", \
+"just woke up". Today's pacing starts from now. Not for a message that merely \
+mentions the morning while reporting a drink.
 - later: they have not drunk anything yet and want to be asked again soon. Use \
 this for "not yet", "in a bit", and for anything they say they did NOT drink.
 - chat: none of the above. Put a friendly reply of at most two sentences in \
@@ -785,7 +790,7 @@ def normalise_photo(path: Path) -> bytes | None:
 			done = subprocess.run(
 				["sips", "-s", "format", "jpeg", "-Z", str(PHOTO_MAX_PX),
 				 str(path), "--out", str(out)],
-				capture_output=True, text=True, timeout=20,
+				capture_output=True, text=True, timeout=20, check=False,
 			)
 			if done.returncode != 0 or not out.exists():
 				detail = done.stderr.strip().splitlines()
@@ -1031,7 +1036,7 @@ def push_notification(text: str, title: str = "Water tracker") -> bool:
 				"-H", f"Title: {title}",
 				"--data-binary", "@-", PUSH_URL,
 			],
-			input=text, capture_output=True, text=True, timeout=PUSH_TIMEOUT + 5,
+			input=text, capture_output=True, text=True, timeout=PUSH_TIMEOUT + 5, check=False,
 		)
 	except subprocess.TimeoutExpired:
 		print(f"   push timed out after {PUSH_TIMEOUT}s")
@@ -1083,7 +1088,7 @@ def load_state(quarantine: bool = True) -> dict | None:
 	logged ounce was gone. The bad file is moved aside instead of overwritten.
 	"""
 	try:
-		return json.loads(STATE_PATH.read_text())
+		return json.loads(STATE_PATH.read_text(encoding="utf-8"))
 	except FileNotFoundError:
 		return {}
 	except json.JSONDecodeError as error:
@@ -1333,7 +1338,7 @@ class WaterTracker:
 			self.state["sent_echoes"] = []
 		self.reply_warning_shown = False
 		self.photo_warning_shown = False
-		self.last_db_stamp = None
+		self.last_db_stamp: tuple[Any, ...] | None = None
 
 	# ----- state -----
 
@@ -1345,7 +1350,7 @@ class WaterTracker:
 		mid-write (a launchd restart, a power cut) left invalid JSON behind.
 		"""
 		scratch = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-		with scratch.open("w") as handle:
+		with scratch.open("w", encoding="utf-8") as handle:
 			json.dump(self.state, handle, indent=2)
 			handle.flush()
 			os.fsync(handle.fileno())
@@ -1520,8 +1525,13 @@ class WaterTracker:
 
 	# ----- messaging -----
 
-	def require_phone(self) -> None:
-		"""Fail before doing any work when there is nowhere to send."""
+	def require_phone(self) -> str:
+		"""Fail before doing any work when there is nowhere to send.
+
+		Returns the handle, so callers use a value that has been checked rather
+		than reaching for the attribute again and leaving it to a reader to
+		remember this ran first.
+		"""
 		if not self.phone:
 			raise SystemExit('Missing WATER_PHONE, e.g. export WATER_PHONE="+15551234567"')
 		if not looks_like_handle(self.phone):
@@ -1530,9 +1540,10 @@ class WaterTracker:
 				"address. Messages will refuse it and no reminder will arrive.\n"
 				"Set your own number, digits included: export WATER_PHONE=\"+15551234567\""
 			)
+		return self.phone
 
 	def send(self, message: str, push: bool = False) -> None:
-		self.require_phone()
+		phone = self.require_phone()
 		if not message.startswith(MARKER):
 			message = f"{MARKER} {message}"
 		print(f"{paint('→', 'cyan')} {message}")
@@ -1556,13 +1567,13 @@ class WaterTracker:
 				return
 		try:
 			result = subprocess.run(
-				["osascript", "-", self.phone, message],
+				["osascript", "-", phone, message],
 				input=SEND_SCRIPT,
 				capture_output=True,
 				text=True,
 				# An unanswered Automation prompt blocks osascript indefinitely,
 				# which would otherwise wedge the whole reminder loop.
-				timeout=SEND_TIMEOUT,
+				timeout=SEND_TIMEOUT, check=False,
 			)
 		except subprocess.TimeoutExpired:
 			print(f"   send timed out after {SEND_TIMEOUT}s; approve the Messages prompt")
@@ -1708,7 +1719,7 @@ class WaterTracker:
 				print(f"   could not query Messages: {error}")
 				return []
 
-		mine = digits(self.phone)
+		mine = digits(self.require_phone())
 		replies, stale = [], 0
 		for rowid, text, blob, handle, raw_date in rows:
 			self.state["last_rowid"] = rowid
@@ -1818,8 +1829,8 @@ class WaterTracker:
 			return
 		amount = photo_amount(plan)
 		if amount is None:
-			note = (plan.get("note") or "").strip()
-			tail = f" {note[:MAX_CHAT_CHARS]}" if note else ""
+			said = (plan.get("note") or "").strip()
+			tail = f" {said[:MAX_CHAT_CHARS]}" if said else ""
 			self.send(f"Couldn't tell what that holds.{tail} How much was it?")
 			return
 		ounces, how = amount
@@ -1829,22 +1840,23 @@ class WaterTracker:
 		# reading of what was actually swallowed.
 		self.log_reply(ounces, f" I {how} — text an amount to correct it.")
 
-	def log_reply(self, ounces: float, note: str = "") -> None:
+	def log_reply(self, ounces: float, extra: str = "") -> None:
+		"""Log an amount from a reply and answer it. `extra` is appended as-is."""
 		self.add(ounces, "reply")
 		if self.total() < self.goal:
 			remaining = self.goal - self.total()
-			self.send(f"Logged {ounces:g} oz. {self.progress_line()} — {remaining:g} oz to go.{note}")
+			self.send(f"Logged {ounces:g} oz. {self.progress_line()} — {remaining:g} oz to go.{extra}")
 			return
 		# congratulated_on was recorded and never read, so every drink after
 		# the goal was met got the same "Goal hit" fanfare and streak count.
 		if self.state["congratulated_on"] == self.today():
-			self.send(f"Logged {ounces:g} oz. {self.total():g} oz today, past your goal.{note}")
+			self.send(f"Logged {ounces:g} oz. {self.total():g} oz today, past your goal.{extra}")
 			return
 		self.state["congratulated_on"] = self.today()
 		self.save()
 		streak = self.streak()
-		suffix = f" {streak}-day streak." if streak > 1 else ""
-		self.send(f"Logged {ounces:g} oz. Goal hit at {self.total():g} oz.{suffix}{note}")
+		run = f" {streak}-day streak." if streak > 1 else ""
+		self.send(f"Logged {ounces:g} oz. Goal hit at {self.total():g} oz.{run}{extra}")
 
 	def follow_plan(self, plan: dict) -> None:
 		"""Act on Claude's reading of a message.
@@ -1951,12 +1963,12 @@ class WaterTracker:
 
 		if ounces is not None and not amount_is_negated(text):
 			# One sentence can do both: "had 20 oz, you can stop for today".
-			note = ""
+			extra = ""
 			if intent == "pause":
-				note = " " + self.pause()
+				extra = " " + self.pause()
 			elif intent == "resume":
-				note = " " + self.resume()
-			self.log_reply(ounces, note)
+				extra = " " + self.resume()
+			self.log_reply(ounces, extra)
 			return
 
 		if intent == "status":
@@ -2276,7 +2288,8 @@ def install_agent() -> None:
 			script=escape(str(Path(__file__).resolve())),
 			environment=environment,
 			log=escape(str(LOG_PATH)),
-		)
+		),
+		encoding="utf-8",
 	)
 	secret = next((name for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if name in settings), None)
 	if secret:
@@ -2412,7 +2425,7 @@ def doctor() -> None:
 		interpreters[arguments[0]] = "the LaunchAgent's python"
 	for interpreter, label in interpreters.items():
 		probe = subprocess.run(
-			[interpreter, "-c", READ_PROBE, str(CHAT_DB)], capture_output=True, text=True
+			[interpreter, "-c", READ_PROBE, str(CHAT_DB)], capture_output=True, text=True, check=False,
 		)
 		if probe.returncode == 0:
 			check(True, f"{label} can read Messages history, so replies are picked up")
@@ -2425,7 +2438,11 @@ def doctor() -> None:
 	log = agent_log_since_start()
 	if any("Cannot read Messages history" in line for line in log):
 		target = arguments[0] if arguments else sys.executable
-		check(False, f"the running agent reports it cannot read replies: add {target} to Full Disk Access, then reload")
+		check(
+			False,
+			f"the running agent reports it cannot read replies: "
+			f"add {target} to Full Disk Access, then reload",
+		)
 	elif log:
 		check(True, f"agent log clean since it started ({len(log)} line(s) in {LOG_PATH})")
 	for line in log:
@@ -2433,7 +2450,10 @@ def doctor() -> None:
 			check(False, f"agent log: {line.strip()}")
 
 	if PLIST_PATH.exists():
-		loaded = subprocess.run(["launchctl", "list", PLIST_LABEL], capture_output=True).returncode == 0
+		listing = subprocess.run(
+			["launchctl", "list", PLIST_LABEL], capture_output=True, check=False
+		)
+		loaded = listing.returncode == 0
 		check(loaded, f"LaunchAgent {'loaded' if loaded else 'installed but not loaded'}")
 		if "PYTHONUNBUFFERED" not in agent:
 			check(False, f"LaunchAgent predates unbuffered logging, so {LOG_PATH} stays empty; re-run install")
@@ -2443,7 +2463,7 @@ def doctor() -> None:
 	# pgrep -f matches the launchd job and a hand-started loop alike; this
 	# process is running 'doctor', so it cannot match itself.
 	pids = subprocess.run(
-		["pgrep", "-f", "waterTracker.py run"], capture_output=True, text=True
+		["pgrep", "-f", "waterTracker.py run"], capture_output=True, text=True, check=False,
 	).stdout.split()
 	check(bool(pids), f"loop running (pid {', '.join(pids)})" if pids else "no reminder loop is running")
 
