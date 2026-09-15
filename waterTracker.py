@@ -41,6 +41,11 @@ Setup:
 	python waterTracker.py log 40 yesterday   # or: monday, 3 days ago, 2026-09-10
 	python waterTracker.py undo yesterday     # drop that day's last entry
 	python waterTracker.py set 96 yesterday   # replace a day; 0 clears it
+	python waterTracker.py status yesterday   # any past day, not just today
+	python waterTracker.py goal 120           # show or change the daily goal
+	python waterTracker.py pause / resume     # stop or restart today's nudges
+	python waterTracker.py export > water.csv # the whole log, or --json
+	python waterTracker.py help               # all of the above
 	python waterTracker.py test       # send one text to check delivery
 	python waterTracker.py doctor     # explain why reminders are not arriving
 	python waterTracker.py install    # keep the loop running via launchd
@@ -75,6 +80,7 @@ Replies can be whole sentences — amounts and commands are picked out of the te
 """
 
 import base64
+import csv
 import json
 import os
 import plistlib
@@ -1206,17 +1212,23 @@ def note(text: str, indent: str = "  ") -> None:
 	print(f"{indent}{paint(text, 'dim')}")
 
 
-def print_status(tracker: "WaterTracker") -> None:
-	total, goal = tracker.total(), tracker.goal
-	entries = tracker.entries()
-	heading(f"💧 Water · {date.today():%a %b %-d}")
+def print_status(tracker: "WaterTracker", day: date | None = None) -> None:
+	"""Draw a day. Pace and streak are today's questions, so a past day omits them."""
+	day = day or date.today()
+	live = day == date.today()
+	total, goal = tracker.day_total(day), tracker.goal
+	entries = tracker.day_entries(day)
+	heading(f"💧 Water · {day:%a %b %-d}" + ("" if live else f" · {tracker.day_name(day)}"))
 
 	if goal:
 		fraction = total / goal
 		percent = f"{fraction * 100:.0f}%".rjust(4)
 		tone = "green" if fraction >= 1 else "bold"
 		width = bar_width(14)
-		print(f"  {meter(fraction, width, pace=tracker.expected_by_now() / goal)} {paint(percent, tone)}")
+		# A finished day has no pace left to keep, so the tick would only be
+		# marking where you should have been on a day already over.
+		pace = tracker.expected_by_now() / goal if live else None
+		print(f"  {meter(fraction, width, pace=pace)} {paint(percent, tone)}")
 		remaining = goal - total
 		if remaining > 0:
 			tail = paint(f"{remaining:g} oz to go", "dim")
@@ -1228,7 +1240,7 @@ def print_status(tracker: "WaterTracker") -> None:
 		# loud is what turns "47%" into something you can act on, because half
 		# the goal at noon and half of it at ten at night are not the same day.
 		drift = total - tracker.expected_by_now()
-		if goal and total < goal:
+		if live and goal and total < goal:
 			if drift < -1:
 				print(f"  {paint(f'▽ {-drift:.0f} oz behind an even pace for this hour', 'yellow')}")
 			elif drift > 1:
@@ -1240,14 +1252,16 @@ def print_status(tracker: "WaterTracker") -> None:
 
 	print()
 	if not entries:
-		note("nothing logged yet today — try: waterTracker.py log 16")
+		when = "yet today" if live else f"on {tracker.day_name(day)}"
+		hint = "log 16" if live else f"log 16 {day.isoformat()}"
+		note(f"nothing logged {when} — try: waterTracker.py {hint}")
 	for index, entry in enumerate(entries):
 		amount = f"{entry['oz']:g}"
 		# Only the most recent one is worth dating: it answers "should I be
 		# drinking now", which the rest of the list cannot. The source is padded
 		# before it is painted, or the escapes would count toward the column.
 		newest = index == len(entries) - 1
-		since = ago(entry["at"]) if newest else ""
+		since = ago(entry["at"]) if newest and live else ""
 		source = f"{entry['via']:<10}" if since else entry["via"]
 		line = (
 			f"  {paint(entry['at'][11:16], 'dim')}"
@@ -1256,7 +1270,7 @@ def print_status(tracker: "WaterTracker") -> None:
 		)
 		print(f"{line} {paint('· ' + since, 'dim')}" if since else line)
 
-	streak = tracker.streak()
+	streak = tracker.streak() if live else 0
 	if streak:
 		print(f"\n  {paint(f'🔥 {streak} day streak at goal', 'yellow')}")
 	print()
@@ -2558,8 +2572,61 @@ def doctor() -> None:
 	print()
 
 
+def export(tracker: "WaterTracker", as_json: bool = False) -> None:
+	"""Write the whole log to stdout, oldest first, for a spreadsheet or a backup.
+
+	Plain stdout rather than a file argument, so it composes with a redirect and
+	cannot overwrite anything by accident. Never painted: this is data, and a
+	colour code in a CSV would be read as part of a field.
+	"""
+	rows = [
+		(day, entry)
+		for day in sorted(tracker.state["days"])
+		for entry in tracker.state["days"][day]
+	]
+	if as_json:
+		print(json.dumps(
+			[{"day": day, "at": e["at"], "oz": e["oz"], "via": e["via"]} for day, e in rows],
+			indent=2,
+		))
+		return
+	writer = csv.writer(sys.stdout)
+	writer.writerow(["day", "at", "oz", "via"])
+	for day, entry in rows:
+		writer.writerow([day, entry["at"], f"{entry['oz']:g}", entry["via"]])
+
+
+USAGE = """\
+waterTracker — text yourself water reminders and log the replies.
+
+  run                     the reminder loop (default when no command is given)
+  status [day]            today's intake, or any day you name
+  week [n]                the last n days, average and days at goal (default 7)
+  log <amount> [day]      log an amount: 16, "2 cups", 500ml
+  undo [day]              drop that day's last entry
+  set <amount> [day]      replace a day outright; 0 clears it
+  goal [amount]           show the daily goal, or change it
+  pause | resume          stop or restart today's reminders
+  export [--json]         the whole log as CSV, or as JSON
+  test                    send one text to check delivery
+  doctor                  explain why reminders are not arriving
+  install                 write the LaunchAgent so the loop survives logout
+  help                    this
+
+A day is "yesterday", a weekday name, "3 days ago" or 2026-09-10. Days older
+than WATER_KEEP_DAYS are gone, and editing one is refused rather than lost.
+
+  python3 waterTracker.py log 40 yesterday
+  python3 waterTracker.py status monday
+  python3 waterTracker.py export > water.csv
+"""
+
+
 def main(argv: list[str]) -> None:
 	command = argv[0] if argv else "run"
+	if command in ("help", "-h", "--help"):
+		print(USAGE)
+		return
 	if command == "install":
 		install_agent()
 		return
@@ -2570,7 +2637,23 @@ def main(argv: list[str]) -> None:
 	tracker = WaterTracker()
 
 	if command == "status":
-		print_status(tracker)
+		day, _ = split_day(" ".join(argv[1:]))
+		print_status(tracker, day)
+	elif command == "goal":
+		if len(argv) > 1:
+			ounces = extract_ounces(" ".join(argv[1:]))
+			if ounces is None:
+				raise SystemExit("Could not read that goal, try '120' or '2 litres'.")
+			print(f"{paint('✓', 'green')} {tracker.set_goal(ounces)}")
+		else:
+			print(f"Daily goal is {paint(f'{tracker.goal:g} oz', 'bold')}.")
+	elif command == "pause":
+		tracker.pause()
+		print(f"{paint('✓', 'green')} Paused for today. Run 'resume' to start again.")
+	elif command == "resume":
+		print(f"{paint('✓', 'green')} {tracker.resume()}")
+	elif command == "export":
+		export(tracker, as_json="--json" in argv[1:])
 	elif command == "week":
 		days = int(argv[1]) if len(argv) > 1 else 7
 		print_week(tracker, days)
@@ -2616,8 +2699,7 @@ def main(argv: list[str]) -> None:
 		tracker.run()
 	else:
 		raise SystemExit(
-			f"Unknown command {command!r}. "
-			"Use run, status, week, log, undo, set, test, doctor, or install."
+			f"Unknown command {command!r}.\n\n{USAGE}"
 		)
 
 

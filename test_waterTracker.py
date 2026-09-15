@@ -8,6 +8,7 @@ Claude client is a stand-in that records what it was asked.
 """
 
 import base64
+import csv
 import importlib.util
 import io
 import json
@@ -365,7 +366,14 @@ class TrackerTestCase(unittest.TestCase):
 		self.addCleanup(setattr, module, name, previous)
 
 	def set_day(self, day, ounces):
+		"""Give a day a total. Saved, so a test that runs main() sees it too.
+
+		main() builds its own tracker from the state file, so a day left only in
+		this one's memory would be invisible to it -- which looks exactly like
+		the command under test having done nothing.
+		"""
 		self.tracker.state["days"][day.isoformat()] = [{"at": f"{day}T09:00:00", "oz": ounces, "via": "test"}]
+		self.tracker.save()
 
 
 class PushTest(TrackerTestCase):
@@ -1379,6 +1387,107 @@ class HistoryByTextTest(TrackerTestCase):
 	def test_a_bare_amount_is_untouched_by_any_of_this(self):
 		self.tracker.handle_reply("16 oz")
 		self.assertEqual(self.tracker.total(), 16)
+
+
+class ConvenienceCommandTest(TrackerTestCase):
+	"""The commands that only existed by text until now, plus help and export."""
+
+	def setUp(self):
+		super().setUp()
+		self.yesterday = date.today() - timedelta(days=1)
+		self.patch(wt, "colour_ready", lambda: False)
+
+	def run_command(self, *argv):
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.main(list(argv))
+		return printed.getvalue()
+
+	def test_help_lists_every_command_it_accepts(self):
+		# The usage block is the only description of this interface, so a
+		# command missing from it is a command nobody finds.
+		output = self.run_command("help")
+		for command in ("run", "status", "week", "log", "undo", "set", "goal",
+		                "pause", "resume", "export", "test", "doctor", "install"):
+			with self.subTest(command=command):
+				self.assertIn(command, output)
+
+	def test_an_unknown_command_shows_the_same_usage(self):
+		with self.assertRaises(SystemExit) as raised:
+			self.run_command("frobnicate")
+		self.assertIn("frobnicate", str(raised.exception))
+		self.assertIn("status [day]", str(raised.exception))
+
+	def test_goal_reports_and_changes(self):
+		self.assertIn("100 oz", self.run_command("goal"))
+		self.run_command("goal", "120")
+		self.assertEqual(wt.WaterTracker().goal, 120)
+		self.assertIn("120 oz", self.run_command("goal"))
+
+	def test_goal_accepts_units_like_everything_else(self):
+		self.run_command("goal", "2", "litres")
+		self.assertAlmostEqual(wt.WaterTracker().goal, 67.6, places=1)
+
+	def test_pause_and_resume_reach_the_state_the_loop_reads(self):
+		self.run_command("pause")
+		self.assertEqual(wt.WaterTracker().state["paused_on"], date.today().isoformat())
+		self.run_command("resume")
+		self.assertIsNone(wt.WaterTracker().state["paused_on"])
+
+	def test_resume_only_clears_the_pause_once(self):
+		# It used to be called twice in this branch, which saved the file twice
+		# to reach the same state.
+		calls = []
+		self.patch(wt.WaterTracker, "resume", lambda self: calls.append(1) or "Reminders back on.")
+		self.run_command("resume")
+		self.assertEqual(len(calls), 1)
+
+	def test_status_reads_a_past_day(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.add(16, "cli")
+		output = self.run_command("status", "yesterday")
+		self.assertIn("44", output)
+		self.assertNotIn("16 oz", output, "showed today instead of the day asked for")
+
+	def test_a_past_day_drops_the_questions_that_are_only_about_today(self):
+		# Pace, the streak and "how long ago" all answer "should I drink now",
+		# which a finished day cannot be asked.
+		#
+		# The days at goal are the point: without a streak to suppress, the
+		# assertion below passes whether or not anything suppresses it.
+		self.set_day(self.yesterday, 100)
+		self.set_day(self.yesterday - timedelta(days=1), 100)
+		self.tracker.add(20, "cli")
+		self.assertEqual(self.tracker.streak(), 2, "the fixture has no streak to hide")
+
+		self.assertIn("streak", self.run_command("status"), "today lost its streak line")
+
+		past = self.run_command("status", "yesterday")
+		self.assertNotIn("pace", past)
+		self.assertNotIn("streak", past)
+		self.assertNotIn("ago", past)
+
+	def test_export_writes_every_entry_oldest_first(self):
+		self.set_day(self.yesterday, 44)
+		self.tracker.add(16, "cli")
+		rows = list(csv.reader(io.StringIO(self.run_command("export"))))
+		self.assertEqual(rows[0], ["day", "at", "oz", "via"])
+		self.assertEqual([row[0] for row in rows[1:]],
+		                 [self.yesterday.isoformat(), date.today().isoformat()])
+		self.assertEqual([row[2] for row in rows[1:]], ["44", "16"])
+
+	def test_export_is_never_painted(self):
+		# A colour code inside a CSV field is read as part of the data.
+		self.patch(wt, "colour_ready", lambda: True)
+		self.tracker.add(16, "cli")
+		self.assertNotIn("\033", self.run_command("export"))
+
+	def test_export_json_round_trips(self):
+		self.set_day(self.yesterday, 44)
+		loaded = json.loads(self.run_command("export", "--json"))
+		self.assertEqual(len(loaded), 1)
+		self.assertEqual(loaded[0]["oz"], 44)
+		self.assertEqual(loaded[0]["day"], self.yesterday.isoformat())
 
 
 class HistoryCommandTest(TrackerTestCase):

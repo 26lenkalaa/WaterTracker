@@ -86,6 +86,11 @@ python3 waterTracker.py log 16     # log without texting: also "2 cups", "500ml"
 python3 waterTracker.py log 40 yesterday   # backfill a past day
 python3 waterTracker.py undo yesterday     # drop that day's last entry
 python3 waterTracker.py set 96 yesterday   # replace a day outright; 0 clears it
+python3 waterTracker.py status yesterday   # any past day, not just today
+python3 waterTracker.py goal 120           # show or change the daily goal
+python3 waterTracker.py pause              # and resume
+python3 waterTracker.py export > water.csv # the whole log as CSV, or --json
+python3 waterTracker.py help               # every command, with examples
 python3 waterTracker.py test       # send one text to check delivery
 python3 waterTracker.py doctor     # explain why reminders are not arriving
 python3 waterTracker.py install    # write the LaunchAgent
@@ -194,6 +199,43 @@ Sun ██████░░░░ 60.3
 A test asserts the rule rather than the appearance: no texted line may contain
 a double space or leading padding. The 💧 stays first on every message — it's
 how the tracker recognises its own echo in a self-chat, not decoration.
+
+### Small things
+
+`goal`, `pause` and `resume` used to work only by text, which meant reaching for
+your phone to change a number on the machine you were already sitting at. They
+are commands now, and `help` prints the whole interface — previously the only
+description of it was the source.
+
+`status` takes a day, using the same references as `log` and `set`:
+
+```
+$ python3 waterTracker.py status yesterday
+
+💧 Water · Mon Sep 14 · yesterday
+
+  ███████████▊░░░░░░░░░░░░░░░░░░░░  37%
+  44 / 120 oz  ·  76 oz to go
+
+  12:00      44 oz  cli
+```
+
+A finished day drops the pace line, the streak and the "how long ago" marker.
+All three answer *should I be drinking now*, which is not a question a day
+that's already over can be asked.
+
+`export` writes the whole log to stdout as CSV, or `--json`, oldest first:
+
+```
+$ python3 waterTracker.py export > water.csv
+day,at,oz,via
+2026-09-14,2026-09-14T12:00:00,44,cli
+2026-09-15,2026-09-15T18:43:22,20,cli
+```
+
+It goes to stdout rather than taking a filename, so it composes with a redirect
+and can't overwrite anything by accident, and it is never coloured — an escape
+code inside a CSV field is read as part of the data.
 
 ### Fixing a day you got wrong
 
@@ -547,7 +589,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 238 tests, ~0.5s
+python3 -m unittest discover .        # 249 tests, ~0.5s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a
