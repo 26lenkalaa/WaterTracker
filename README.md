@@ -200,6 +200,53 @@ A test asserts the rule rather than the appearance: no texted line may contain
 a double space or leading padding. The 💧 stays first on every message — it's
 how the tracker recognises its own echo in a self-chat, not decoration.
 
+### Streaks
+
+A run of days at goal is the one number here worth looking after, so it works
+the way Snapchat's and Duolingo's do — with the two mechanics that make those
+matter, rather than just a counter.
+
+**You're told before you lose it.** Four hours before `WATER_SLEEP_HOUR`, a
+live streak with the goal unmet turns the nudge into a warning:
+
+```
+💧 Time to drink water. 40/100 oz ████░░░░░░ 40% 42 oz behind pace.
+⏳ Your 5 day streak ends tonight — 60 oz to go. (1 freeze in hand.)
+```
+
+Not earlier. Before that there's still an ordinary day to finish, and a warning
+at noon is just nagging.
+
+**One bad day doesn't erase a month.** You earn a freeze for every 7 days at
+goal, hold at most 2, and one is spent automatically on the first day you miss:
+
+```
+❄️ Used a streak freeze on yesterday — your 7 day streak is safe. No freezes left.
+```
+
+Earning is deliberately slower than spending. With unlimited freezes a streak
+never breaks, and a streak that can't break isn't worth keeping.
+
+Three things the freeze deliberately doesn't do:
+
+| | Why |
+|---|---|
+| change your logged total | it protects the streak, not the figures — the week still shows the 0 you actually drank, marked `❄` rather than `✓` |
+| get spent on a day with no run behind it | freezing a lone missed day buys nothing; it's worth more kept for a day holding a streak up |
+| get decided the same day | a day can't be judged until it's over, so this settles at the midnight rollover |
+
+`status` shows the run, your record, and what's in hand:
+
+```
+  🔥 5 day streak · best 9
+  ❄  1 freeze · covers a missed day
+```
+
+Milestones at 3, 7, 14, 30, 50, 100, 200 and 365 days get said once each — kept
+sparse, because a milestone every day isn't a milestone, and this arrives as a
+text message. A lost streak still leaves `best_streak` behind, so the record
+outlives the run.
+
 ### Small things
 
 `goal`, `pause` and `resume` used to work only by text, which meant reaching for
@@ -341,6 +388,9 @@ All optional except the phone number.
 | `WATER_PUSH_URL` | — | push nudges here as well as texting them |
 | `WATER_PUSH_TIMEOUT` | 10 | seconds before a push gives up |
 | `WATER_PUSH_ONLY` | — | `on` to push instead of texting, not as well |
+| `WATER_FREEZE_EVERY` | 7 | days at goal that earn one streak freeze |
+| `WATER_MAX_FREEZES` | 2 | how many freezes can be held at once |
+| `WATER_RISK_HOURS` | 4 | how long before `WATER_SLEEP_HOUR` a streak is called at risk |
 | `NO_COLOR` | — | set to anything to turn off terminal colour |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
@@ -589,7 +639,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 249 tests, ~0.5s
+python3 -m unittest discover .        # 269 tests, ~0.5s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a

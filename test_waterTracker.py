@@ -1389,6 +1389,198 @@ class HistoryByTextTest(TrackerTestCase):
 		self.assertEqual(self.tracker.total(), 16)
 
 
+class StreakFreezeTest(TrackerTestCase):
+	"""Forgiveness: one missed day should not erase a month."""
+
+	def setUp(self):
+		super().setUp()
+		self.today = date.today()
+
+	def run_of(self, days, ending_days_ago=1):
+		"""Put `days` days at goal in a row, ending `ending_days_ago` back."""
+		for offset in range(ending_days_ago, ending_days_ago + days):
+			self.set_day(self.today - timedelta(days=offset), 100)
+
+	def test_a_frozen_day_counts_toward_the_streak(self):
+		self.run_of(3, ending_days_ago=2)
+		self.assertEqual(self.tracker.streak(), 0, "yesterday was missed, so the run is broken")
+		self.tracker.state["frozen_days"].append((self.today - timedelta(days=1)).isoformat())
+		self.assertEqual(self.tracker.streak(), 4, "the freeze did not bridge the gap")
+
+	def test_settling_spends_a_freeze_on_a_missed_day(self):
+		self.run_of(6, ending_days_ago=2)
+		self.tracker.state["freezes"] = 1
+		message = self.tracker.settle_streak()
+		self.assertIn("streak freeze", message)
+		self.assertEqual(self.tracker.state["freezes"], 0)
+		self.assertEqual(self.tracker.streak(), 7, "the run did not survive")
+
+	def test_settling_happens_once_a_day(self):
+		self.run_of(6, ending_days_ago=2)
+		self.tracker.state["freezes"] = 2
+		self.assertIsNotNone(self.tracker.settle_streak())
+		self.assertIsNone(self.tracker.settle_streak(), "spent a second freeze on the same day")
+		self.assertEqual(self.tracker.state["freezes"], 1)
+
+	def test_a_settled_day_does_no_further_writing(self):
+		# The loop calls this every poll. Freezing yesterday already makes a
+		# second spend impossible, so what the date guard actually buys is not
+		# rewriting the state file three times a minute all day -- every write
+		# another chance to be interrupted mid-file.
+		self.tracker.settle_streak()
+		writes = []
+		self.patch(wt.WaterTracker, "save", lambda self: writes.append(1))
+		for _ in range(5):
+			self.tracker.settle_streak()
+		self.assertEqual(writes, [], "rewrote the log on a day already settled")
+
+	def test_a_freeze_is_not_spent_when_there_is_no_run_to_protect(self):
+		# Nothing behind yesterday, so freezing it buys nothing and the freeze
+		# is worth more kept for a day that is actually holding a streak up.
+		self.tracker.state["freezes"] = 1
+		self.assertIsNone(self.tracker.settle_streak())
+		self.assertEqual(self.tracker.state["freezes"], 1)
+
+	def test_without_a_freeze_the_run_simply_ends(self):
+		self.run_of(6, ending_days_ago=2)
+		self.tracker.state["freezes"] = 0
+		self.assertIsNone(self.tracker.settle_streak())
+		self.assertEqual(self.tracker.streak(), 0)
+
+	def test_a_frozen_day_is_still_a_day_you_did_not_drink(self):
+		# The freeze protects the streak, not the figures: the week still shows
+		# what actually went in, or the log stops being a record.
+		self.run_of(1, ending_days_ago=2)
+		self.tracker.state["frozen_days"].append((self.today - timedelta(days=1)).isoformat())
+		self.assertEqual(self.tracker.day_total(self.today - timedelta(days=1)), 0)
+
+	def test_frozen_days_are_forgotten_with_the_days_themselves(self):
+		stale = (self.today - timedelta(days=wt.KEEP_DAYS + 5)).isoformat()
+		self.tracker.state["frozen_days"].append(stale)
+		self.tracker.settle_streak()
+		self.assertNotIn(stale, self.tracker.state["frozen_days"], "kept a freeze past its day")
+
+
+class StreakRewardTest(TrackerTestCase):
+	"""Earning: what a run gives back."""
+
+	def test_a_freeze_is_earned_every_seventh_day(self):
+		for offset in range(1, wt.FREEZE_EVERY):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+		self.tracker.add(100, "cli")  # completes the seventh day
+		self.assertEqual(self.tracker.streak(), wt.FREEZE_EVERY)
+		self.assertIn("freeze", self.tracker.streak_earned() or "")
+		self.assertEqual(self.tracker.state["freezes"], 1)
+
+	def test_freezes_do_not_pile_up_past_the_cap(self):
+		# Earning has to be slower than spending, or the streak stops meaning
+		# anything: with unlimited freezes it never breaks.
+		for offset in range(1, wt.FREEZE_EVERY):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+		self.tracker.add(100, "cli")
+		self.tracker.state["freezes"] = wt.MAX_FREEZES
+		earned = self.tracker.streak_earned() or ""
+		self.assertNotIn("freeze", earned)
+		self.assertEqual(self.tracker.state["freezes"], wt.MAX_FREEZES)
+
+	def test_a_milestone_is_announced_once(self):
+		for offset in range(1, 3):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+		self.tracker.add(100, "cli")  # third day in a row
+		self.assertIn("3 days in a row", self.tracker.streak_earned() or "")
+		self.assertNotIn("3 days in a row", self.tracker.streak_earned() or "", "said it twice")
+
+	def test_the_best_run_outlives_the_current_one(self):
+		for offset in range(1, 4):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+		self.tracker.add(100, "cli")
+		self.assertEqual(self.tracker.record_best(), 4)
+		self.tracker.state["days"] = {}          # the run is lost
+		self.assertEqual(self.tracker.streak(), 0)
+		self.assertEqual(self.tracker.state["best_streak"], 4, "the record went with it")
+
+
+class StreakRiskTest(TrackerTestCase):
+	"""Being told before you lose it, which is the whole mechanic."""
+
+	def evening(self, hour):
+		today = date.today()
+		return datetime(today.year, today.month, today.day, hour)
+
+	def setUp(self):
+		super().setUp()
+		for offset in range(1, 6):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+
+	def test_nothing_is_at_risk_early_in_the_day(self):
+		# There is still an ordinary day to finish; warning at noon is nagging.
+		self.assertEqual(self.tracker.streak_at_risk(self.evening(9)), 0)
+
+	def test_the_run_is_at_risk_once_the_evening_is_short(self):
+		self.assertEqual(self.tracker.streak_at_risk(self.evening(20)), 5)
+
+	def test_meeting_the_goal_ends_the_risk(self):
+		self.tracker.add(100, "cli")
+		self.assertEqual(self.tracker.streak_at_risk(self.evening(20)), 0)
+
+	def test_no_run_means_nothing_to_warn_about(self):
+		self.tracker.state["days"] = {}
+		self.assertEqual(self.tracker.streak_at_risk(self.evening(20)), 0)
+
+	def test_the_nudge_says_what_is_at_stake(self):
+		self.patch(wt.WaterTracker, "streak_at_risk", lambda self, now=None: 5)
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.state["freezes"] = 1
+		self.tracker.maybe_remind()
+		self.assertIn("5 day streak ends tonight", self.sent[-1])
+		self.assertIn("freeze in hand", self.sent[-1])
+		self.assertNotIn("\033", self.sent[-1], "an escape reached a text message")
+
+	def test_an_ordinary_nudge_is_unchanged(self):
+		self.patch(wt.WaterTracker, "streak_at_risk", lambda self, now=None: 0)
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.maybe_remind()
+		self.assertIn("How much?", self.sent[-1])
+		self.assertNotIn("ends tonight", self.sent[-1])
+
+
+class StreakDisplayTest(TrackerTestCase):
+	"""What the terminal shows about a run."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "colour_ready", lambda: False)
+
+	def render(self, *argv):
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.main(list(argv))
+		return printed.getvalue()
+
+	def test_status_shows_the_run_and_the_record(self):
+		for offset in range(1, 4):
+			self.set_day(date.today() - timedelta(days=offset), 100)
+		self.tracker.add(100, "cli")
+		self.tracker.state["best_streak"] = 9
+		self.tracker.save()
+		output = self.render("status")
+		self.assertIn("4 day streak", output)
+		self.assertIn("best 9", output)
+
+	def test_a_frozen_day_is_marked_apart_from_a_day_at_goal(self):
+		# Both keep the streak; only one is water you drank.
+		frozen = date.today() - timedelta(days=1)
+		self.set_day(date.today() - timedelta(days=2), 100)
+		self.tracker.state["frozen_days"] = [frozen.isoformat()]
+		self.tracker.save()
+		rows = [line for line in self.render("week", "3").splitlines() if "-" in line]
+		frozen_row = next(line for line in rows if frozen.strftime("%m-%d") in line)
+		met_row = next(line for line in rows if (date.today() - timedelta(days=2)).strftime("%m-%d") in line)
+		self.assertIn("❄", frozen_row)
+		self.assertIn("✓", met_row)
+		self.assertNotIn("✓", frozen_row, "a frozen day claimed to be a day at goal")
+
+
 class ConvenienceCommandTest(TrackerTestCase):
 	"""The commands that only existed by text until now, plus help and export."""
 

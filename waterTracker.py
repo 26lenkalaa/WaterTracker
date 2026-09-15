@@ -8,6 +8,9 @@ Setup:
 	export WATER_SLEEP_HOUR="22"        # optional, no nudges after this hour
 	export WATER_KEEP_DAYS="90"         # optional, how long history is kept
 	export WATER_STALE_REPLY_MIN="60"   # optional, ignore replies older than this
+	export WATER_FREEZE_EVERY="7"       # optional, days at goal per streak freeze
+	export WATER_MAX_FREEZES="2"        # optional, how many can be held at once
+	export WATER_RISK_HOURS="4"         # optional, warn this long before sleep
 
 	Claude reads your replies when it can, which is what lets you text whatever
 	you like instead of a fixed vocabulary. It needs `pip install anthropic` and
@@ -119,6 +122,23 @@ FOLLOWUP_MIN = int(os.getenv("WATER_FOLLOWUP_MIN", "60"))
 FOLLOWUP_GRACE_MIN = int(os.getenv("WATER_FOLLOWUP_GRACE_MIN", "30"))
 STATE_PATH = Path(os.getenv("WATER_STATE_FILE", "water_tracker_state.json"))
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
+
+# Streaks. A run of days at goal is the one number here that rewards looking
+# after it, so it gets the two mechanics that make Snapchat's and Duolingo's
+# work: you are told before you lose one, and a single bad day does not erase
+# a month.
+#
+# A freeze is earned for every FREEZE_EVERY days at goal and spent
+# automatically on the first day missed, up to MAX_FREEZES held. Earning has to
+# be slower than spending or the streak stops meaning anything.
+FREEZE_EVERY = int(os.getenv("WATER_FREEZE_EVERY", "7"))
+MAX_FREEZES = int(os.getenv("WATER_MAX_FREEZES", "2"))
+# How long before SLEEP_HOUR a live streak starts being called at risk. Early
+# enough to still drink the water, late enough that it is not nagging at noon.
+RISK_HOURS_BEFORE_SLEEP = float(os.getenv("WATER_RISK_HOURS", "4"))
+# Worth saying out loud once each. Kept sparse: a milestone every day is not a
+# milestone, and this arrives as a text message.
+MILESTONES = (3, 7, 14, 30, 50, 100, 200, 365)
 
 # A reply that only confirms drinking, with no amount, counts as this much.
 DEFAULT_SERVING_OZ = float(os.getenv("WATER_DEFAULT_OZ", "8"))
@@ -1270,10 +1290,37 @@ def print_status(tracker: "WaterTracker", day: date | None = None) -> None:
 		)
 		print(f"{line} {paint('· ' + since, 'dim')}" if since else line)
 
-	streak = tracker.streak() if live else 0
-	if streak:
-		print(f"\n  {paint(f'🔥 {streak} day streak at goal', 'yellow')}")
+	if live:
+		print_streak(tracker)
 	print()
+
+
+def print_streak(tracker: "WaterTracker") -> None:
+	"""The streak line: what it is, what threatens it, and what protects it."""
+	streak, best = tracker.streak(), tracker.state["best_streak"]
+	freezes, at_risk = tracker.state["freezes"], tracker.streak_at_risk()
+	if not (streak or best or freezes):
+		return
+
+	print()
+	if at_risk:
+		short = tracker.goal - tracker.total()
+		print(f"  {paint(f'⏳ {at_risk} day streak ends tonight', 'yellow')}"
+		      f"  {paint(f'· {short:g} oz to go', 'dim')}")
+	elif streak:
+		print(f"  {paint(f'🔥 {streak} day streak', 'yellow')}"
+		      f"{paint(' · best ' + str(best), 'dim') if best > streak else ''}")
+	elif best:
+		print(f"  {paint(f'best streak {best} days', 'dim')}")
+
+	if freezes:
+		held = "❄ " * freezes
+		print(f"  {paint(held.strip(), 'cyan')}  "
+		      f"{paint(f'{freezes} freeze{chr(115) if freezes != 1 else chr(32)}'.strip(), 'dim')}"
+		      f"{paint(' · covers a missed day', 'dim')}")
+	elif streak:
+		togo = FREEZE_EVERY - (streak % FREEZE_EVERY)
+		print(f"  {paint(f'next freeze in {togo} day{chr(115) if togo != 1 else chr(32)}'.strip(), 'dim')}")
 
 
 def print_week(tracker: "WaterTracker", days: int) -> None:
@@ -1306,13 +1353,18 @@ def print_week(tracker: "WaterTracker", days: int) -> None:
 		if 0 <= goal_column - len(cells) < len(track):
 			track[goal_column - len(cells)] = "┊"
 		met = goal and total >= goal
+		frozen = not met and day.isoformat() in tracker.state["frozen_days"]
 		bar = paint("".join(cells), "green" if met else "cyan") + paint("".join(track), "dim")
 		label = f"{day:%a %m-%d}"
 		if day == date.today():
 			label = paint(label, "bold")
 		amount = f"{total:g}"
 		row = f"  {label}  {bar} {amount:>5} {paint('oz', 'dim')}"
-		print(f"{row}  {paint('✓', 'green')}" if met else row)
+		if met:
+			row += f"  {paint('✓', 'green')}"
+		elif frozen:
+			row += f"  {paint('❄', 'cyan')}"
+		print(row)
 
 	drunk = sum(total for _, total in totals)
 	summary = paint(f"{drunk / len(totals):.0f} oz/day average", "bold")
@@ -1346,6 +1398,13 @@ class WaterTracker:
 		# Set by texting 'awake' — a Shortcuts automation on the Wake Up
 		# trigger can do that without anyone touching the phone.
 		self.state.setdefault("woke_at", None)
+		# Streak bookkeeping. frozen_days are days that did not meet the goal
+		# but were covered by a freeze, so the walk counts through them.
+		self.state.setdefault("best_streak", 0)
+		self.state.setdefault("freezes", 0)
+		self.state.setdefault("frozen_days", [])
+		self.state.setdefault("settled_on", None)
+		self.state.setdefault("milestone_hit", 0)
 		# Echoes were a bare list of message strings before they carried a
 		# timestamp. Anything written in the old shape is long stale.
 		if not all(isinstance(echo, list) and len(echo) == 2 for echo in self.state["sent_echoes"]):
@@ -1519,8 +1578,16 @@ class WaterTracker:
 		summary = f"{days} days · {average:.0f} oz/day average · {met_count} at goal"
 		return [summary] + rows
 
+	def day_met(self, day: date) -> bool:
+		"""Whether a day counts toward a streak, by being drunk or by being frozen."""
+		if not self.goal:
+			return False
+		if self.day_total(day) >= self.goal:
+			return True
+		return day.isoformat() in self.state["frozen_days"]
+
 	def streak(self) -> int:
-		"""Consecutive days up to yesterday that met the goal, plus today if met.
+		"""Consecutive days up to yesterday that count, plus today if it does.
 
 		No goal, no streak. Without this the walk never finds a day under the
 		goal to stop at, and counts backwards out of the range of date itself.
@@ -1529,13 +1596,91 @@ class WaterTracker:
 			return 0
 		count = 0
 		day = date.today()
-		if self.total() < self.goal:
+		if not self.day_met(day):
 			day -= timedelta(days=1)
-		while True:
-			if self.day_total(day) < self.goal:
-				return count
+		while self.day_met(day):
 			count += 1
 			day -= timedelta(days=1)
+		return count
+
+	def record_best(self) -> int:
+		"""Keep the longest run ever, so a lost streak still leaves something."""
+		current = self.streak()
+		if current > self.state["best_streak"]:
+			self.state["best_streak"] = current
+			self.save()
+		return current
+
+	def risk_deadline(self) -> float:
+		"""The hour at which today's streak starts being called at risk."""
+		return max(float(WAKE_HOUR), SLEEP_HOUR - RISK_HOURS_BEFORE_SLEEP)
+
+	def streak_at_risk(self, now: datetime | None = None) -> int:
+		"""The run that ends tonight if nothing more is drunk, else 0.
+
+		Counted to yesterday on purpose: once today is met there is nothing at
+		risk, and before the deadline there is still an ordinary day to finish.
+		"""
+		now = now or datetime.now()
+		if not self.goal or self.total() >= self.goal:
+			return 0
+		if now.hour + now.minute / 60 < self.risk_deadline():
+			return 0
+		behind = date.today() - timedelta(days=1)
+		count = 0
+		while self.day_met(behind):
+			count += 1
+			behind -= timedelta(days=1)
+		return count
+
+	def settle_streak(self) -> str | None:
+		"""Once a day, decide what happened to yesterday. The message, or None.
+
+		A freeze is only worth spending on a day that was actually protecting
+		something, so a miss with no run behind it is left to break nothing.
+		Run at the rollover because a day cannot be judged until it is over.
+		"""
+		today = self.today()
+		if self.state["settled_on"] == today:
+			return None
+		self.state["settled_on"] = today
+		yesterday = date.today() - timedelta(days=1)
+		spent = None
+		if self.goal and not self.day_met(yesterday) and self.day_met(yesterday - timedelta(days=1)):
+			if self.state["freezes"] > 0:
+				self.state["freezes"] -= 1
+				self.state["frozen_days"].append(yesterday.isoformat())
+				held = self.state["freezes"]
+				spent = (
+					f"\u2744\ufe0f Used a streak freeze on {self.day_name(yesterday)} — "
+					f"your {self.streak()} day streak is safe. "
+					+ (f"{held} freeze{'s' if held != 1 else ''} left." if held else "No freezes left.")
+				)
+			else:
+				self.state["milestone_hit"] = 0
+		self.state["frozen_days"] = [
+			day for day in self.state["frozen_days"]
+			if day >= (date.today() - timedelta(days=KEEP_DAYS)).isoformat()
+		]
+		self.save()
+		return spent
+
+	def streak_earned(self) -> str | None:
+		"""Called when today first meets the goal. A milestone or a new freeze."""
+		current = self.record_best()
+		notes = []
+		if current in MILESTONES and current > self.state["milestone_hit"]:
+			self.state["milestone_hit"] = current
+			notes.append(f"\U0001f3c6 {current} days in a row.")
+		if current and current % FREEZE_EVERY == 0 and self.state["freezes"] < MAX_FREEZES:
+			self.state["freezes"] += 1
+			notes.append(
+				f"\u2744\ufe0f Earned a streak freeze ({self.state['freezes']}/{MAX_FREEZES}) — "
+				"it covers one missed day."
+			)
+		if notes:
+			self.save()
+		return " ".join(notes) or None
 
 	# ----- messaging -----
 
@@ -1869,8 +2014,12 @@ class WaterTracker:
 		self.state["congratulated_on"] = self.today()
 		self.save()
 		streak = self.streak()
-		run = f" {streak}-day streak." if streak > 1 else ""
-		self.send(f"Logged {ounces:g} oz. Goal hit at {self.total():g} oz.{run}{extra}")
+		run = f" \U0001f525 {streak} day streak." if streak > 1 else ""
+		earned = self.streak_earned()
+		self.send(
+			f"Logged {ounces:g} oz. Goal hit at {self.total():g} oz.{run}{extra}"
+			+ (f"\n{earned}" if earned else "")
+		)
 
 	def follow_plan(self, plan: dict) -> None:
 		"""Act on Claude's reading of a message.
@@ -2154,10 +2303,19 @@ class WaterTracker:
 		nudge = NUDGES[int(time.time() // 60) % len(NUDGES)]
 		deficit = self.expected_by_now() - self.total()
 		behind = f" {deficit:.0f} oz behind pace." if deficit >= 1 else ""
-		self.send(
-			f"\U0001f4a7 {nudge} {self.progress_line()}{behind}\nHow much?",
-			push=True,
-		)
+		# The whole point of a streak is being told before you lose it. This
+		# replaces the usual sign-off rather than adding to it, so the message
+		# stays one glance long.
+		at_risk = self.streak_at_risk()
+		if at_risk:
+			short = self.goal - self.total()
+			tail = (
+				f"\n\u23f3 Your {at_risk} day streak ends tonight — {short:g} oz to go."
+				+ (f" ({self.state['freezes']} freeze in hand.)" if self.state["freezes"] else "")
+			)
+		else:
+			tail = "\nHow much?"
+		self.send(f"\U0001f4a7 {nudge} {self.progress_line()}{behind}{tail}", push=True)
 
 	def run(self) -> None:
 		self.require_phone()
@@ -2184,6 +2342,11 @@ class WaterTracker:
 					if dropped:
 						print(f"   forgot {dropped} day(s) older than {KEEP_DAYS} days")
 					self.save()
+				# A day cannot be judged until it is over, so this runs at the
+				# rollover rather than when the goal is missed.
+				spent = self.settle_streak()
+				if spent:
+					self.send(spent, push=True)
 				try:
 					for _, body, photos in self.read_replies():
 						self.handle_reply(body, photos)
@@ -2281,6 +2444,9 @@ def install_agent() -> None:
 		"WATER_PUSH_URL",
 		"WATER_PUSH_TIMEOUT",
 		"WATER_PUSH_ONLY",
+		"WATER_FREEZE_EVERY",
+		"WATER_MAX_FREEZES",
+		"WATER_RISK_HOURS",
 		# launchd jobs inherit nothing from your shell, so the key has to be
 		# written into the plist or the agent quietly loses interpretation.
 		"ANTHROPIC_API_KEY",
