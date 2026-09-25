@@ -28,9 +28,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-os.environ.setdefault("WATER_PHONE", "+15551234567")
-# Forced, not defaulted: with a key in the environment the suite would
-# otherwise send every test reply to the real API.
+# Every WATER_* setting goes before the module is imported, because the module
+# reads all 26 of them at import time and any one left set would quietly change
+# what these tests are testing. WATER_LLM was already forced rather than
+# defaulted -- a key in the environment would otherwise send every test reply to
+# the real API -- and the same argument covers the rest of the namespace.
+#
+# WATER_PHONE is what proved it: exported in a shell, it beat the setdefault
+# below, and the test that rewrites a handle to (555) 123-4567 stopped matching
+# and started passing for no reason anyone would have noticed.
+for _leaked in [_name for _name in os.environ if _name.startswith("WATER_")]:
+	del os.environ[_leaked]
+os.environ["WATER_PHONE"] = "+15551234567"
 os.environ["WATER_LLM"] = "off"
 _spec = importlib.util.spec_from_file_location("waterTracker", Path(__file__).with_name("waterTracker.py"))
 # Both are None if the file is not where this expects it. Saying so here turns
