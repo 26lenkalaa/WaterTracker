@@ -11,6 +11,7 @@ Setup:
 	export WATER_FREEZE_EVERY="7"       # optional, days at goal per streak freeze
 	export WATER_MAX_FREEZES="2"        # optional, how many can be held at once
 	export WATER_RISK_HOURS="4"         # optional, warn this long before sleep
+	export WATER_WAKE_PHRASE="wake up"  # optional, the text that ends sleep mode
 
 	Claude reads your replies when it can, which is what lets you text whatever
 	you like instead of a fixed vocabulary. It needs `pip install anthropic` and
@@ -47,6 +48,7 @@ Setup:
 	python waterTracker.py status yesterday   # any past day, not just today
 	python waterTracker.py goal 120           # show or change the daily goal
 	python waterTracker.py pause / resume     # stop or restart today's nudges
+	python waterTracker.py sleep              # go quiet until texted the phrase
 	python waterTracker.py export > water.csv # the whole log, or --json
 	python waterTracker.py help               # all of the above
 	python waterTracker.py test       # send one text to check delivery
@@ -139,6 +141,16 @@ RISK_HOURS_BEFORE_SLEEP = float(os.getenv("WATER_RISK_HOURS", "4"))
 # Worth saying out loud once each. Kept sparse: a milestone every day is not a
 # milestone, and this arrives as a text message.
 MILESTONES = (3, 7, 14, 30, 50, 100, 200, 365)
+
+# Sleep mode: the loop keeps running but does nothing except listen for one
+# phrase. It has to keep running, because a process that has exited cannot be
+# texted back to life -- "asleep" here means silent and idle, not stopped.
+#
+# Matched against the whole message once stripped of punctuation and case, not
+# searched for inside it, so "just woke up" does not trip it and neither does
+# any sentence that happens to contain it. That exactness is the point: this is
+# the single door back in.
+WAKE_PHRASE = os.getenv("WATER_WAKE_PHRASE", "wake up").strip().lower()
 
 # A reply that only confirms drinking, with no amount, counts as this much.
 DEFAULT_SERVING_OZ = float(os.getenv("WATER_DEFAULT_OZ", "8"))
@@ -550,6 +562,16 @@ def decode_body(blob: bytes | None) -> str:
 		return tail[:length].decode("utf-8", "replace").strip()
 	except (IndexError, UnicodeDecodeError):
 		return ""
+
+
+def says_wake_phrase(text: str) -> bool:
+	"""Whether a message is the wake phrase and nothing else.
+
+	Punctuation and case are forgiven because phones add both; extra words are
+	not, because the whole value of one exact phrase is that nothing else opens
+	the door by accident.
+	"""
+	return re.sub(r"[^a-z0-9 ]", "", text.strip().lower()).strip() == WAKE_PHRASE
 
 
 def digits(handle: str) -> str:
@@ -1146,6 +1168,16 @@ STYLES = {
 }
 
 
+def count(number: int, thing: str, plural: str = "") -> str:
+	"""A number and its noun, pluralised. "1 reply", "3 replies", "0 replies".
+
+	Written out because "reply(s)" is the sound a program makes when nobody
+	looked at its output, and this output is read by someone trying to work out
+	why their reminders stopped.
+	"""
+	return f"{number} {thing if number == 1 else (plural or thing + 's')}"
+
+
 def colour_ready() -> bool:
 	"""True when stdout is a terminal that wants escapes.
 
@@ -1239,6 +1271,13 @@ def print_status(tracker: "WaterTracker", day: date | None = None) -> None:
 	total, goal = tracker.day_total(day), tracker.goal
 	entries = tracker.day_entries(day)
 	heading(f"💧 Water · {day:%a %b %-d}" + ("" if live else f" · {tracker.day_name(day)}"))
+	if tracker.asleep:
+		# First, and in its own right: every number below is real, and none of
+		# it is being acted on. Someone looking at this is usually asking why
+		# nothing has arrived.
+		slept = ago(tracker.state["asleep_since"]).replace(" ago", "")
+		print(f"  {paint('☾ asleep', 'yellow')} {paint(f'· {slept} · text ', 'dim')}"
+		      f"{paint(repr(WAKE_PHRASE).strip(chr(39)), 'bold')}{paint(' to wake me', 'dim')}\n")
 
 	if goal:
 		fraction = total / goal
@@ -1296,31 +1335,37 @@ def print_status(tracker: "WaterTracker", day: date | None = None) -> None:
 
 
 def print_streak(tracker: "WaterTracker") -> None:
-	"""The streak line: what it is, what threatens it, and what protects it."""
+	"""The streak, what threatens it, and what protects it — on one line.
+
+	Two lines of furniture for one number read as a dashboard nobody asked
+	for, so the freezes are a suffix on the streak rather than a row of their
+	own, and the snowflakes carry the count instead of repeating it in words.
+	"""
 	streak, best = tracker.streak(), tracker.state["best_streak"]
 	freezes, at_risk = tracker.state["freezes"], tracker.streak_at_risk()
 	if not (streak or best or freezes):
 		return
 
-	print()
 	if at_risk:
 		short = tracker.goal - tracker.total()
-		print(f"  {paint(f'⏳ {at_risk} day streak ends tonight', 'yellow')}"
-		      f"  {paint(f'· {short:g} oz to go', 'dim')}")
+		lead = paint(f"\u23f3 {at_risk} day streak ends tonight", "yellow")
+		trail = [f"{short:g} oz to go"]
 	elif streak:
-		print(f"  {paint(f'🔥 {streak} day streak', 'yellow')}"
-		      f"{paint(' · best ' + str(best), 'dim') if best > streak else ''}")
-	elif best:
-		print(f"  {paint(f'best streak {best} days', 'dim')}")
+		lead = paint(f"\U0001f525 {streak} day streak", "yellow")
+		trail = [f"best {best}"] if best > streak else []
+	else:
+		lead = paint(f"best streak {count(best, 'day')}", "dim")
+		trail = []
 
+	# Held freezes are shown, not counted out: three snowflakes say "three"
+	# faster than the word does, and this line is read at a glance.
 	if freezes:
-		held = "❄ " * freezes
-		print(f"  {paint(held.strip(), 'cyan')}  "
-		      f"{paint(f'{freezes} freeze{chr(115) if freezes != 1 else chr(32)}'.strip(), 'dim')}"
-		      f"{paint(' · covers a missed day', 'dim')}")
+		lead += "  " + paint("\u2744" * freezes, "cyan")
+		trail.append("covers a missed day" if freezes == 1 else "each covers a missed day")
 	elif streak:
-		togo = FREEZE_EVERY - (streak % FREEZE_EVERY)
-		print(f"  {paint(f'next freeze in {togo} day{chr(115) if togo != 1 else chr(32)}'.strip(), 'dim')}")
+		trail.append(f"next freeze in {count(FREEZE_EVERY - streak % FREEZE_EVERY, 'day')}")
+
+	print(f"\n  {lead}{paint('  · ' + ' · '.join(trail), 'dim') if trail else ''}")
 
 
 def print_week(tracker: "WaterTracker", days: int) -> None:
@@ -1336,7 +1381,7 @@ def print_week(tracker: "WaterTracker", days: int) -> None:
 		for offset in range(days - 1, -1, -1)
 	]
 	scale = max([goal] + [total for _, total in totals]) or 1
-	width = bar_width(34)
+	width = bar_width(36)
 	# Only worth a tick when a day ran past the goal and pushed the scale out
 	# with it. Otherwise the goal is the right-hand edge of the track and marking
 	# it says nothing.
@@ -1359,7 +1404,12 @@ def print_week(tracker: "WaterTracker", days: int) -> None:
 		if day == date.today():
 			label = paint(label, "bold")
 		amount = f"{total:g}"
-		row = f"  {label}  {bar} {amount:>5} {paint('oz', 'dim')}"
+		# A gutter marker for today. Bold alone was doing that job, and bold is
+		# the one attribute a terminal is most likely to render as nothing.
+		gutter = paint("▸", "cyan") if day == date.today() else " "
+		# No "oz" per row: the heading says the unit once, and repeating it
+		# seven times turns a column of figures into a column of prose.
+		row = f"  {gutter} {label}  {bar} {amount:>5}"
 		if met:
 			row += f"  {paint('✓', 'green')}"
 		elif frozen:
@@ -1372,7 +1422,7 @@ def print_week(tracker: "WaterTracker", days: int) -> None:
 	if goal:
 		met_count = sum(1 for _, total in totals if total >= goal)
 		summary += f"  {paint('·', 'dim')}  {paint(f'{met_count} of {days} days at goal', 'dim')}"
-	print(f"\n  {summary}\n")
+	print(f"\n    {summary}\n")
 
 
 class WaterTracker:
@@ -1405,6 +1455,10 @@ class WaterTracker:
 		self.state.setdefault("frozen_days", [])
 		self.state.setdefault("settled_on", None)
 		self.state.setdefault("milestone_hit", 0)
+		# When the tracker was put to sleep, or None while it is awake. A
+		# timestamp rather than a flag so 'doctor' and 'status' can say how long
+		# it has been quiet, which is the question someone actually has.
+		self.state.setdefault("asleep_since", None)
 		# Echoes were a bare list of message strings before they carried a
 		# timestamp. Anything written in the old shape is long stale.
 		if not all(isinstance(echo, list) and len(echo) == 2 for echo in self.state["sent_echoes"]):
@@ -1640,6 +1694,10 @@ class WaterTracker:
 		something, so a miss with no run behind it is left to break nothing.
 		Run at the rollover because a day cannot be judged until it is over.
 		"""
+		# A streak is not lost to a tracker that was switched off, and a freeze
+		# is not spent on a day nobody was asked about.
+		if self.asleep:
+			return None
 		today = self.today()
 		if self.state["settled_on"] == today:
 			return None
@@ -1902,7 +1960,7 @@ class WaterTracker:
 				continue
 			replies.append((rowid, body, photos))
 		if stale:
-			print(f"   skipped {stale} reply(s) older than {STALE_REPLY_MIN} min")
+			print(f"   skipped {count(stale, 'reply', 'replies')} older than {STALE_REPLY_MIN} min")
 		# Recorded only after a clean read, so a failed copy is retried on the
 		# next poll instead of being treated as already seen.
 		self.last_db_stamp = stamp
@@ -1921,6 +1979,42 @@ class WaterTracker:
 		print(f"Watching for replies after message {self.state['last_rowid']}.")
 
 	# ----- reply handling -----
+
+	@property
+	def asleep(self) -> bool:
+		return bool(self.state["asleep_since"])
+
+	def sleep(self) -> str:
+		"""Go quiet indefinitely. Only the wake phrase brings it back.
+
+		Not pause: a pause is for today and lifts itself at midnight, on
+		'resume', or the next time you say you are awake. This lifts for one
+		thing only, which is what makes it worth having as well.
+		"""
+		self.state["asleep_since"] = datetime.now().isoformat(timespec="seconds")
+		# A nudge left outstanding would be chased the moment it wakes, hours
+		# or months later, about water it stopped asking for.
+		self.state["awaiting_reply_since"] = None
+		self.save()
+		return f"Sleeping. Text '{WAKE_PHRASE}' to wake me."
+
+	def wake_from_sleep(self) -> str:
+		"""Come back. The nudge clock restarts so waking is not also a nudge."""
+		since = self.state["asleep_since"]
+		self.state["asleep_since"] = None
+		# Without this the first poll after waking sees a last_nudge_at from
+		# before the sleep and fires immediately, which is a greeting and an
+		# interruption in the same second.
+		self.state["last_nudge_at"] = time.time()
+		self.state["awaiting_reply_since"] = None
+		self.save()
+		slept = ""
+		try:
+			if since:
+				slept = f" Slept {ago(since).replace(' ago', '')}."
+		except (TypeError, ValueError):
+			slept = ""
+		return f"\U0001f4a7 Awake.{slept} {self.progress_line()}"
 
 	def pause(self) -> str:
 		self.state["paused_on"] = self.today()
@@ -2056,7 +2150,7 @@ class WaterTracker:
 			self.send(f"{plan['chat']}\n{self.progress_line()}")
 
 	def handle_reply(self, body: str, photos: list[Path] | None = None) -> None:
-		print(f"<- {body}" + (f" [{len(photos)} photo(s)]" if photos else ""))
+		print(f"<- {body}" + (f" [{count(len(photos), 'photo')}]" if photos else ""))
 		# Any reply answers the outstanding nudge, whatever it turns out to
 		# mean. Someone texting 'status' or 'not yet' has the phone in hand, so
 		# a follow-up would be chasing a person who is plainly already there.
@@ -2064,6 +2158,23 @@ class WaterTracker:
 		# still counts as having been answered.
 		self.state["awaiting_reply_since"] = None
 		self.save()
+
+		# The gate. Asleep, exactly one message does anything at all, and it is
+		# checked before the photo branch and before any interpretation -- a
+		# sleeping tracker must not be reachable through the model, the pattern
+		# matching, or a picture of a bottle.
+		if self.asleep:
+			if says_wake_phrase(body):
+				print("   woken by the wake phrase")
+				self.send(self.wake_from_sleep())
+			else:
+				# Silent on purpose. Answering would make it a tracker that
+				# talks back, which is the thing sleep is for not doing. The
+				# log line is here so a confused person running it in a
+				# terminal can see it is listening rather than broken.
+				print(f"   asleep; ignored (text '{WAKE_PHRASE}' to wake me)")
+			return
+
 		if photos and not body:
 			self.log_photo(photos[0])
 			return
@@ -2248,7 +2359,10 @@ class WaterTracker:
 		'not yet' counts as an answer, so it lands here as silence rather than
 		as another prod.
 		"""
-		if not self.follow_up_due():
+		# Guarded here as well as in maybe_remind. Nothing reaches this except
+		# through there today, but "the only caller happens to check" is not a
+		# property worth relying on in the method that does the talking.
+		if self.asleep or not self.follow_up_due():
 			return
 		# Recorded before sending, like last_nudge_at below, so a failed send
 		# does not retry on every poll for the rest of the gap.
@@ -2265,6 +2379,8 @@ class WaterTracker:
 		)
 
 	def maybe_remind(self) -> None:
+		if self.asleep:
+			return
 		if self.state["paused_on"] == self.today():
 			return
 		if self.total() >= self.goal:
@@ -2340,10 +2456,13 @@ class WaterTracker:
 					self.state["pruned_on"] = self.today()
 					dropped = self.prune_days()
 					if dropped:
-						print(f"   forgot {dropped} day(s) older than {KEEP_DAYS} days")
+						print(f"   forgot {count(dropped, 'day')} older than {KEEP_DAYS} days")
 					self.save()
 				# A day cannot be judged until it is over, so this runs at the
-				# rollover rather than when the goal is missed.
+				# rollover rather than when the goal is missed. Skipped while
+				# asleep: freezes are not spent on days nobody was being asked
+				# about, and a streak is not something you lose to a tracker you
+				# switched off.
 				spent = self.settle_streak()
 				if spent:
 					self.send(spent, push=True)
@@ -2356,6 +2475,9 @@ class WaterTracker:
 				# used to skip maybe_remind() on every pass, silently killing
 				# reminders for as long as the failure lasted.
 				try:
+					# Reading replies above still happens while asleep: that is
+					# the one thing a sleeping tracker does, and the only way
+					# back. maybe_remind returns immediately instead.
 					self.maybe_remind()
 				except Exception as error:
 					print(f"   error sending reminder: {error}")
@@ -2447,6 +2569,7 @@ def install_agent() -> None:
 		"WATER_FREEZE_EVERY",
 		"WATER_MAX_FREEZES",
 		"WATER_RISK_HOURS",
+		"WATER_WAKE_PHRASE",
 		# launchd jobs inherit nothing from your shell, so the key has to be
 		# written into the plist or the agent quietly loses interpretation.
 		"ANTHROPIC_API_KEY",
@@ -2624,7 +2747,7 @@ def doctor() -> None:
 			f"add {target} to Full Disk Access, then reload",
 		)
 	elif log:
-		check(True, f"agent log clean since it started ({len(log)} line(s) in {LOG_PATH})")
+		check(True, f"agent log clean since it started ({count(len(log), 'line')} in {LOG_PATH})")
 	for line in log:
 		if "send failed" in line or "send timed out" in line:
 			check(False, f"agent log: {line.strip()}")
@@ -2651,6 +2774,13 @@ def doctor() -> None:
 	goal = float(state.get("goal_oz") or GOAL_OZ)
 	total = sum(entry["oz"] for entry in state.get("days", {}).get(today, []))
 	paused = state.get("paused_on") == today
+	# Asleep is a state, not a fault, so it reads as a fact -- but it is the
+	# whole answer to "why has nothing arrived", so it comes before the rest of
+	# the timing and says how to undo itself.
+	asleep_since = state.get("asleep_since")
+	if asleep_since:
+		detail(f"ASLEEP since {asleep_since.replace('T', ' ')} — nothing is being sent")
+		detail(f"text {WAKE_PHRASE!r} to wake it; everything below is paused, not broken")
 	check(not paused, "paused for today, reply 'resume'" if paused else "not paused")
 	# Read the same way the loop reads it, or doctor reports a window the
 	# tracker is not actually using once 'awake' has been texted.
@@ -2678,7 +2808,9 @@ def doctor() -> None:
 	# once the goal is met, silence is the design and flagging it is noise.
 	last_nudge = float(state.get("last_nudge_at") or 0)
 	quiet_because = None
-	if not awake:
+	if asleep_since:
+		quiet_because = f"it is asleep; text {WAKE_PHRASE!r} to wake it"
+	elif not awake:
 		quiet_because = f"it is outside {WAKE_HOUR}:00-{SLEEP_HOUR}:00"
 	elif paused:
 		quiet_because = "it is paused for today"
@@ -2728,7 +2860,7 @@ def doctor() -> None:
 	# problem. Say which it was.
 	print()
 	if failures:
-		print(f"  {paint(f'{len(failures)} problem(s) to fix:', 'bold', 'red')}")
+		print(f"  {paint(count(len(failures), 'problem') + ' to fix:', 'bold', 'red')}")
 		for failure in failures:
 			print(f"    {paint('•', 'red')} {failure}")
 	else:
@@ -2773,6 +2905,7 @@ waterTracker — text yourself water reminders and log the replies.
   set <amount> [day]      replace a day outright; 0 clears it
   goal [amount]           show the daily goal, or change it
   pause | resume          stop or restart today's reminders
+  sleep                   go quiet indefinitely; only a text wakes it
   export [--json]         the whole log as CSV, or as JSON
   test                    send one text to check delivery
   doctor                  explain why reminders are not arriving
@@ -2813,6 +2946,9 @@ def main(argv: list[str]) -> None:
 			print(f"{paint('✓', 'green')} {tracker.set_goal(ounces)}")
 		else:
 			print(f"Daily goal is {paint(f'{tracker.goal:g} oz', 'bold')}.")
+	elif command == "sleep":
+		print(f"{paint('✓', 'green')} {tracker.sleep()}")
+		note("the loop keeps running so it can hear you; it just stops asking")
 	elif command == "pause":
 		tracker.pause()
 		print(f"{paint('✓', 'green')} Paused for today. Run 'resume' to start again.")

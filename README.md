@@ -89,6 +89,7 @@ python3 waterTracker.py set 96 yesterday   # replace a day outright; 0 clears it
 python3 waterTracker.py status yesterday   # any past day, not just today
 python3 waterTracker.py goal 120           # show or change the daily goal
 python3 waterTracker.py pause              # and resume
+python3 waterTracker.py sleep              # go quiet until texted 'wake up'
 python3 waterTracker.py export > water.csv # the whole log as CSV, or --json
 python3 waterTracker.py help               # every command, with examples
 python3 waterTracker.py test       # send one text to check delivery
@@ -199,6 +200,55 @@ Sun ██████░░░░ 60.3
 A test asserts the rule rather than the appearance: no texted line may contain
 a double space or leading padding. The 💧 stays first on every message — it's
 how the tracker recognises its own echo in a self-chat, not decoration.
+
+### Sleep mode
+
+`python3 waterTracker.py sleep` puts the tracker to sleep indefinitely. It sends
+nothing — no nudges, no chases, no streak settling — and ignores every message
+it receives except one:
+
+```
+$ python3 waterTracker.py sleep
+✓ Sleeping. Text 'wake up' to wake me.
+```
+
+Texting `wake up` is the only way back. The phrase is matched against the whole
+message once case and punctuation are stripped, not searched for inside it, so
+`just woke up`, `good morning` and `please wake up now` all leave it asleep.
+`WATER_WAKE_PHRASE` changes it.
+
+This is not `pause`. A pause is for today and lifts itself at midnight, on
+`resume`, or the next time you say you're awake. Sleep lifts for exactly one
+thing, which is the point of having both.
+
+While asleep the loop keeps running, because **a process that has exited can't
+be texted back to life**. "Asleep" means silent and idle, not stopped — it
+polls for replies and does nothing else with them. The gate sits ahead of the
+photo branch and ahead of any interpretation, so there's no route in through
+the model, the pattern matching, or a picture of a bottle. Nothing is logged
+while it sleeps: a tracker that quietly banks your replies and answers none of
+them is worse than one that's plainly off.
+
+`status` and `doctor` both lead with it, because "asleep" and "broken" look
+identical from the outside:
+
+```
+💧 Water · Tue Oct 6
+
+  ☾ asleep · just now · text wake up to wake me
+```
+
+**To stop it entirely** — no process at all, nothing listening — unload the
+LaunchAgent instead. Texting won't wake it then, since nothing is running to
+hear you:
+
+```bash
+launchctl bootout gui/$(id -u)/com.watertracker.reminders   # stop now
+launchctl disable gui/$(id -u)/com.watertracker.reminders   # and at next login
+
+launchctl enable gui/$(id -u)/com.watertracker.reminders    # to undo both
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.watertracker.reminders.plist
+```
 
 ### Streaks
 
@@ -391,6 +441,7 @@ All optional except the phone number.
 | `WATER_FREEZE_EVERY` | 7 | days at goal that earn one streak freeze |
 | `WATER_MAX_FREEZES` | 2 | how many freezes can be held at once |
 | `WATER_RISK_HOURS` | 4 | how long before `WATER_SLEEP_HOUR` a streak is called at risk |
+| `WATER_WAKE_PHRASE` | `wake up` | the exact text that ends sleep mode |
 | `NO_COLOR` | — | set to anything to turn off terminal colour |
 
 Nudges are **paced**: the gap stretches to 1.5× the interval when you're ahead
@@ -639,7 +690,7 @@ JSON object is needed before anything can be logged.
 ## Tests
 
 ```bash
-python3 -m unittest discover .        # 269 tests, ~0.5s
+python3 -m unittest discover .        # 284 tests, ~0.5s
 ```
 
 No network, no Messages access, no real state file: sends are captured in a

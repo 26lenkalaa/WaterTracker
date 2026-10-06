@@ -1398,6 +1398,156 @@ class HistoryByTextTest(TrackerTestCase):
 		self.assertEqual(self.tracker.total(), 16)
 
 
+class SleepModeTest(TrackerTestCase):
+	"""Asleep: one phrase does anything, and nothing else does."""
+
+	def setUp(self):
+		super().setUp()
+		self.tracker.sleep()
+		self.sent.clear()
+
+	def test_sleeping_is_not_pausing(self):
+		# A pause is for today and lifts itself at midnight. This one lifts for
+		# exactly one thing, which is the whole reason it exists separately.
+		self.assertTrue(self.tracker.asleep)
+		self.assertNotEqual(self.tracker.state["paused_on"], self.tracker.today())
+		reopened = wt.WaterTracker()
+		self.assertTrue(reopened.asleep, "sleep did not survive a restart")
+
+	def test_the_phrase_wakes_it_and_nothing_else_does(self):
+		for ignored in ("16 oz", "status", "week", "undo", "goal 200", "pause",
+		                "just woke up", "good morning", "please wake up now",
+		                "wake up the tracker", "sleep"):
+			with self.subTest(message=ignored):
+				self.tracker.handle_reply(ignored)
+				self.assertTrue(self.tracker.asleep, f"{ignored!r} woke it")
+				self.assertEqual(self.sent, [], f"{ignored!r} got an answer")
+
+		self.tracker.handle_reply("wake up")
+		self.assertFalse(self.tracker.asleep, "the phrase did not wake it")
+		self.assertIn("Awake", self.sent[-1])
+
+	def test_the_phrase_forgives_case_and_punctuation_but_not_extra_words(self):
+		for spelling in ("Wake Up", "  wake up  ", "WAKE UP!", "wake up."):
+			with self.subTest(spelling=spelling):
+				self.tracker.state["asleep_since"] = "2026-01-01T00:00:00"
+				self.tracker.handle_reply(spelling)
+				self.assertFalse(self.tracker.asleep, f"{spelling!r} should have woken it")
+
+	def test_nothing_is_logged_while_asleep(self):
+		# Silence has to mean inert. A tracker that quietly banks your replies
+		# and answers none of them is worse than one that is plainly off.
+		self.tracker.handle_reply("32 oz")
+		self.tracker.handle_reply("had two bottles")
+		self.assertEqual(self.tracker.total(), 0)
+
+	def test_a_photo_cannot_reach_a_sleeping_tracker(self):
+		# The gate sits before the photo branch, so there is no way round it
+		# through the vision model either.
+		asked = []
+		self.patch(wt, "llm_photo_plan", lambda path: asked.append(path) or None)
+		self.tracker.handle_reply("", [Path("/tmp/nope.jpg")])
+		self.assertEqual(asked, [], "a sleeping tracker called the model")
+		self.assertEqual(self.sent, [])
+
+	def test_no_nudge_no_chase_no_settling_while_asleep(self):
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.state["awaiting_reply_since"] = time.time() - (wt.FOLLOWUP_MIN + 5) * 60
+		self.tracker.state["followed_up"] = False
+		self.tracker.maybe_remind()
+		self.tracker.maybe_follow_up()
+		self.assertEqual(self.sent, [], "a sleeping tracker sent something")
+
+	def test_each_sending_path_refuses_on_its_own(self):
+		# Guarding only the loop would leave every one of these a direct call
+		# away from speaking. The guard belongs in whatever does the talking.
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.state["awaiting_reply_since"] = time.time() - (wt.FOLLOWUP_MIN + 5) * 60
+		self.tracker.state["followed_up"] = False
+		self.set_day(date.today() - timedelta(days=2), 100)
+		self.tracker.state["freezes"] = 1
+		for name in ("maybe_remind", "maybe_follow_up", "settle_streak"):
+			with self.subTest(path=name):
+				self.sent.clear()
+				getattr(self.tracker, name)()
+				self.assertEqual(self.sent, [], f"{name} spoke while asleep")
+
+	def test_a_freeze_is_not_spent_on_a_day_nobody_was_asked_about(self):
+		self.set_day(date.today() - timedelta(days=2), 100)
+		self.tracker.state["freezes"] = 1
+		self.assertIsNone(self.tracker.settle_streak())
+		self.assertEqual(self.tracker.state["freezes"], 1, "spent a freeze while asleep")
+
+	def test_waking_restarts_the_nudge_clock(self):
+		# Otherwise the first poll after waking sees a last_nudge_at from before
+		# the sleep and fires at once: a greeting and an interruption together.
+		self.tracker.state["last_nudge_at"] = 0
+		self.tracker.handle_reply("wake up")
+		self.sent.clear()
+		self.tracker.maybe_remind()
+		self.assertEqual(self.sent, [], "nudged in the same breath as waking")
+
+	def test_waking_drops_an_outstanding_nudge(self):
+		# Whatever was unanswered when it went to sleep is not worth chasing
+		# months later, about water it stopped asking for.
+		#
+		# Called directly rather than through handle_reply, which clears this
+		# field at the top for its own reasons: routed that way the assertion
+		# passes whether or not waking does anything at all.
+		self.tracker.state["awaiting_reply_since"] = time.time() - 10_000
+		self.tracker.wake_from_sleep()
+		self.assertIsNone(self.tracker.state["awaiting_reply_since"])
+
+	def test_going_to_sleep_drops_an_outstanding_nudge_too(self):
+		self.tracker.state["asleep_since"] = None
+		self.tracker.state["awaiting_reply_since"] = time.time()
+		self.tracker.sleep()
+		self.assertIsNone(self.tracker.state["awaiting_reply_since"])
+
+	def test_everything_works_again_once_awake(self):
+		self.tracker.handle_reply("wake up")
+		self.sent.clear()
+		self.tracker.handle_reply("32 oz")
+		self.assertEqual(self.tracker.total(), 32)
+		self.assertIn("Logged", self.sent[-1])
+
+	def test_the_phrase_is_configurable(self):
+		self.patch(wt, "WAKE_PHRASE", "open sesame")
+		self.tracker.handle_reply("wake up")
+		self.assertTrue(self.tracker.asleep, "the old phrase still worked")
+		self.tracker.handle_reply("Open Sesame!")
+		self.assertFalse(self.tracker.asleep)
+
+
+class SleepReportingTest(TrackerTestCase):
+	"""Being asleep must never look like being broken."""
+
+	def setUp(self):
+		super().setUp()
+		self.patch(wt, "colour_ready", lambda: False)
+		self.tracker.sleep()
+
+	def test_status_says_so_before_anything_else(self):
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.main(["status"])
+		output = printed.getvalue()
+		self.assertIn("asleep", output)
+		self.assertIn("wake up", output, "did not say how to undo it")
+
+	def test_doctor_explains_the_silence_rather_than_reporting_a_fault(self):
+		self.patch(wt, "installed_agent", lambda: {})
+		self.patch(wt, "llm_check", lambda: (True, "pattern matching only"))
+		printed = io.StringIO()
+		with redirect_stdout(printed):
+			wt.doctor()
+		output = printed.getvalue()
+		self.assertIn("ASLEEP", output)
+		self.assertIn("wake up", output)
+		self.assertNotIn("no nudge has been sent yet", output,
+		                 "reported a missing nudge as a fault while asleep")
+
+
 class StreakFreezeTest(TrackerTestCase):
 	"""Forgiveness: one missed day should not erase a month."""
 
